@@ -1,0 +1,60 @@
+# ── Python ────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+venv/
+.venv/
+env/
+ENV/
+
+# ── Model artifacts ───────────────────────────────────────────────────
+# Checkpoints and tokenizers are rebuilt by training — keep them out of git.
+# Publish a model via Git LFS or a release asset instead.
+*.pth
+*.pt
+*.bin
+*.safetensors
+*_tokenizer.json
+checkpoints/
+runs/
+models/
+
+# ── Corpora ───────────────────────────────────────────────────────────
+# Training text can be huge and/or copyrighted.
+*.txt
+corpus/
+corpora/
+data/
+datasets/
+!requirements.txt
+
+# ── Notebook output ───────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+.ipynb_output/
+# Strips cell outputs on commit, which keeps diffs readable and the repo small.
+# Remove the `#` below if you want the notebook's saved outputs published.
+# jupyter nbconvert --version >/dev/null 2>&1 && \
+#   jupyter nbconvert --inplace --clear-output --comment-magics='*' \
+#     Shimba_Colab.ipynb
+
+# ── Tooling ───────────────────────────────────────────────────────────
+.vscode/
+.idea/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.log
+
+# ── OS ────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini

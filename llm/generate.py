@@ -52,15 +52,22 @@ def generate(
     Generate `max_new_tokens` tokens given a text `prompt`.
 
     Returns the full string (prompt + generated continuation).
+
+    Works on whatever device the model lives on — the token tensor is created
+    on that device rather than assumed to be CPU.
     """
     model.eval()
     block_size = model.cfg.block_size
+
+    # Tokens must live on the same device as the model's weights, or the
+    # embedding lookup fails on CUDA/MPS.
+    device = next(model.parameters()).device
 
     # Encode prompt
     ids = tokenizer.encode(prompt)
     if not ids:
         ids = [0]   # fall back to PAD if prompt is empty
-    idx = torch.tensor([ids], dtype=torch.int64)  # (1, T)
+    idx = torch.tensor([ids], dtype=torch.int64, device=device)  # (1, T)
 
     stop_set = set(stop_tokens) if stop_tokens else set()
     generated_ids: List[int] = []
@@ -143,6 +150,7 @@ def stream_generate(
     import sys
     model.eval()
     block_size = model.cfg.block_size
+    device = next(model.parameters()).device
 
     ids = tokenizer.encode(prompt)
     if not ids:
@@ -152,7 +160,7 @@ def stream_generate(
     sys.stdout.write(prompt)
     sys.stdout.flush()
 
-    idx = torch.tensor([ids], dtype=torch.int64)
+    idx = torch.tensor([ids], dtype=torch.int64, device=device)
 
     for _ in range(max_new_tokens):
         idx_cond = idx[:, -block_size:]

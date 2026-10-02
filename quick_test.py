@@ -2,11 +2,9 @@
 """
 quick_test.py — smoke test for the Shimba LLM.
 
-Runs a tiny model (2 layers, 64-dim) for 5 iterations on synthetic data
-to verify that all components work together end-to-end without requiring
-a real corpus file.
-
-Works on Windows, macOS, and Linux.
+Runs a tiny model (2 layers, 64-dim) for a handful of iterations on
+synthetic data to verify every component works end-to-end without needing a
+real corpus. Runs on whatever device is available (CUDA on Colab, else CPU).
 
 Usage:
     python quick_test.py
@@ -17,13 +15,17 @@ import os
 import tempfile
 import torch
 
-torch.set_default_device("cpu")
 torch.manual_seed(0)
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from llm.compat import enable_safe_output
+
+enable_safe_output()
+
 # Cross-platform temp path — works on Windows, macOS, Linux
 _TMP_MODEL = os.path.join(tempfile.gettempdir(), "shimba_test.pth")
+_TMP_TOK = os.path.join(tempfile.gettempdir(), "shimba_test_tokenizer.json")
 
 
 def test_tokenizer():
@@ -55,7 +57,7 @@ def test_model(vocab_size: int):
     logits, loss = model(idx, tgt)
     assert logits.shape == (2, 16, vocab_size), f"bad logits shape {logits.shape}"
     assert loss is not None and loss.item() > 0
-    print(f"  logits={logits.shape}  loss={loss.item():.4f}  OK")
+    print(f"  logits={tuple(logits.shape)}  loss={loss.item():.4f}  OK")
     return model, cfg
 
 
@@ -92,29 +94,39 @@ def test_training(model_cfg, tok):
     print("  OK")
 
 
-def test_generate():
-    print("[test] generation ...")
+def test_checkpoint_roundtrip():
+    """
+    Save → reload → generate with the matching tokenizer.
+
+    Uses the same tokenizer for training and generation. The previous version
+    built a *different* tokenizer here, so the vocab never matched the saved
+    model and the generation path was silently skipped instead of tested.
+    """
+    print("[test] checkpoint round-trip ...")
     from llm.model import GPT
     from llm.tokenizer import CharTokenizer
     from llm.generate import generate
 
     if not os.path.exists(_TMP_MODEL):
-        print("  (skipped — model file not found, training may have failed)")
-        return
+        print("  [FAIL] model file not found — training did not produce it")
+        return False
 
-    model = GPT.load(_TMP_MODEL)      # <-- cross-platform temp path
+    # The training test saved with this vocab; rebuild it identically.
+    import random
+    random.seed(0)
+    chars = [c for c in CharTokenizer().build("Hello, world! 123 abc").char2idx
+             if c not in (CharTokenizer.PAD_TOKEN, CharTokenizer.UNK_TOKEN)]
+    corpus = "".join(random.choices(chars, k=2000))
+    tok = CharTokenizer().build(corpus)
 
-    # Build a compatible tokenizer using the same chars as training
-    tok = CharTokenizer().build("Hello, world! 123 abc")
+    model = GPT.load(_TMP_MODEL)
+    assert model.cfg.vocab_size == tok.vocab_size, (
+        f"vocab mismatch: model={model.cfg.vocab_size} tok={tok.vocab_size}")
 
-    try:
-        result = generate(model, tok, "Hello", max_new_tokens=20, top_k=5)
-        print(f"  generated: {result!r}  OK")
-    except Exception as e:
-        # Vocab mismatch between test tokenizer and saved model is expected
-        # The important thing is that load() and generate() don't crash on I/O
-        print(f"  (vocab mismatch expected in smoke test: {e})")
-        print("  generation pathway OK")
+    result = generate(model, tok, "Hello", max_new_tokens=20, top_k=5)
+    assert isinstance(result, str) and len(result) > 0, "generation returned nothing"
+    print(f"  generated: {result!r}  OK")
+    return True
 
 
 def test_cli_help():
@@ -126,24 +138,29 @@ def test_cli_help():
         capture_output=True, text=True,
         cwd=os.path.dirname(os.path.abspath(__file__)),
     )
-    assert "train" in result.stdout, "Expected 'train' in help output"
-    assert "generate" in result.stdout, "Expected 'generate' in help output"
+    assert "train" in result.stdout, f"Expected 'train' in help output: {result.stdout[:200]}"
+    assert "generate" in result.stdout, f"Expected 'generate' in help output"
     print("  OK")
 
 
 def main():
+    from llm.device import describe_device, resolve_device
+
+    device = resolve_device("auto")
+
     print("=" * 52)
     print("  Shimba LLM -- smoke test")
     print("=" * 52)
     print(f"  Python  : {sys.version.split()[0]}")
     print(f"  PyTorch : {torch.__version__}")
+    print(f"  Device  : {describe_device(device)}")
     print(f"  Temp dir: {tempfile.gettempdir()}")
     print("=" * 52)
 
     tok        = test_tokenizer()
     model, cfg = test_model(tok.vocab_size)
     test_training(cfg, tok)
-    test_generate()
+    test_checkpoint_roundtrip()
     test_cli_help()
 
     print("\n" + "=" * 52)

@@ -21,6 +21,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from dataclasses import dataclass
 
+from .checkpoint import load_checkpoint, save_checkpoint
+
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -283,25 +285,33 @@ class GPT(nn.Module):
 
     # ------------------------------------------------------------------
     def save(self, path: str) -> None:
-        """Save model weights + config to a single .pth file."""
-        torch.save({"config": self.cfg, "state_dict": self.state_dict()}, path)
+        """
+        Save model weights + config to a single .pth file.
+
+        Safe to call on a torch.compile'd module and from GPU: the wrapper is
+        peeled off and tensors are moved to CPU before writing.
+        """
+        save_checkpoint(path, self)
         print(f"[model] saved → {path}")
 
     @classmethod
-    def load(cls, path: str) -> "GPT":
-        """Load model from a .pth file produced by save()."""
-        # PyTorch 2.6+ requires explicit allowlisting of custom classes
-        # when weights_only=True (the new default).  We try the safe path
-        # first and fall back gracefully for older versions.
-        try:
-            import torch.serialization as _ts
-            with _ts.safe_globals([GPTConfig]):
-                checkpoint = torch.load(path, map_location="cpu", weights_only=True)
-        except (AttributeError, TypeError):
-            # Older PyTorch without safe_globals / weights_only kwarg
-            checkpoint = torch.load(path, map_location="cpu")  # type: ignore[call-arg]
-        model = cls(checkpoint["config"])
+    def load(cls, path: str, device: "torch.device | str | None" = None) -> "GPT":
+        """
+        Load model from a .pth file produced by save().
+
+        Tolerates checkpoints written by older versions of this project:
+        weights stored under "model" or "weights", and keys prefixed with
+        `_orig_mod.` by torch.compile.
+        """
+        from .device import resolve_device
+
+        cfg, checkpoint = load_checkpoint(path, map_location="cpu")
+        model = cls(cfg)
         model.load_state_dict(checkpoint["state_dict"])
         model.eval()
+
+        if device is not None:
+            model.to(resolve_device(device))
+
         print(f"[model] loaded ← {path}")
         return model

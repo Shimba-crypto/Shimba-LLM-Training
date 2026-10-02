@@ -1,142 +1,245 @@
 #!/usr/bin/env python3
 """
-quick_train.py — Fast training with checkpoint every iteration and resume support.
+quick_train.py — Training with a checkpoint saved every iteration.
+
+Written for Colab: the runtime can disconnect at any moment, so state is
+flushed to disk after every optimiser step and `--resume` picks up exactly
+where it left off. I/O is throttled to avoid spending more time writing
+checkpoints than training.
+
+Usage:
+    python quick_train.py --data corpus.txt --out model.pth
+    python quick_train.py --data corpus.txt --out model.pth --resume
+    python quick_train.py --data ./texts --out runs/shimba.pth --device cuda --amp
 """
 
-import sys
-import os
 import argparse
-import torch
+import os
+import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from llm.model import GPT, GPTConfig
-from llm.tokenizer import CharTokenizer
+import torch
+
+from llm.checkpoint import save_checkpoint
+from llm.compat import enable_safe_output
 from llm.data import make_splits
-from llm.train import Trainer, TrainConfig
+from llm.device import describe_device
+from llm.model import GPTConfig
+from llm.tokenizer import CharTokenizer
+from llm.train import Trainer, TrainConfig, get_lr, resume_from
 
-class FastTrainer(Trainer):
-    """Trainer that saves checkpoint after every iteration."""
-    def _save_checkpoint(self, iter_num, is_best=False):
-        """Save checkpoint with model, optimizer, scheduler, and iteration."""
-        checkpoint = {
-            "config": self.model.config,
-            "model": self.model.state_dict(),
-            "optimizer": self.optimizer.state_dict(),
-            "iter_num": iter_num,
-            "best_val_loss": self.best_val_loss,
-        }
-        if self.scheduler:
-            checkpoint["scheduler"] = self.scheduler.state_dict()
-        torch.save(checkpoint, self.train_cfg.out_path)
-        if is_best:
-            best_path = self.train_cfg.out_path.replace(".pth", "_best.pth")
-            torch.save(checkpoint, best_path)
-        print(f"  [checkpoint] saved iteration {iter_num}")
+enable_safe_output()
 
-    def train_step(self):
-        """Override to save after each step."""
-        loss = super()._train_step()  # assuming original method is _train_step
-        self._save_checkpoint(self.iter_num, is_best=False)
-        return loss
+
+def load_corpus(path: str, pattern: str = "*.txt") -> str:
+    """Read a single .txt file, or merge every .txt under a directory."""
+    if os.path.isfile(path):
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+
+    if os.path.isdir(path):
+        import fnmatch
+
+        parts = []
+        for root, dirs, files in os.walk(path):
+            dirs.sort()
+            for name in sorted(files):
+                if fnmatch.fnmatch(name.lower(), pattern.lower()):
+                    with open(os.path.join(root, name), "r", encoding="utf-8",
+                              errors="replace") as f:
+                        text = f.read()
+                    if text.strip():
+                        parts.append(text)
+        if not parts:
+            print(f"[quick_train] no files matching '{pattern}' under '{path}'")
+            sys.exit(1)
+        print(f"[quick_train] merged {len(parts)} file(s) from '{path}'")
+        return "\n\n" + ("\n\n" + "=" * 60 + "\n\n").join(parts)
+
+    print(f"[quick_train] --data path not found: '{path}'")
+    sys.exit(1)
+
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--data", required=True, help="Path to .txt file")
-    parser.add_argument("--out", default="model.pth")
-    parser.add_argument("--resume", action="store_true")
-    parser.add_argument("--n_embd", type=int, default=64)
-    parser.add_argument("--n_layer", type=int, default=2)
-    parser.add_argument("--n_head", type=int, default=2)
-    parser.add_argument("--block_size", type=int, default=128)
-    parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--max_iters", type=int, default=2000)
-    parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--eval_interval", type=int, default=200)
-    parser.add_argument("--eval_iters", type=int, default=20)
-    parser.add_argument("--val_frac", type=float, default=0.1)
-    args = parser.parse_args()
+    p = argparse.ArgumentParser(description="Shimba LLM — checkpoint-every-step trainer")
+    p.add_argument("--data", required=True, help="Path to a .txt file OR a folder of .txt files")
+    p.add_argument("--out", default="model.pth")
+    p.add_argument("--resume", action="store_true", help="Continue from --out if it exists")
+    p.add_argument("--pattern", default="*.txt")
+    # Model
+    p.add_argument("--n_embd", type=int, default=64)
+    p.add_argument("--n_layer", type=int, default=2)
+    p.add_argument("--n_head", type=int, default=2)
+    p.add_argument("--block_size", type=int, default=128)
+    p.add_argument("--dropout", type=float, default=0.0)
+    # Training
+    p.add_argument("--batch_size", type=int, default=32)
+    p.add_argument("--grad_accum", type=int, default=1)
+    p.add_argument("--max_iters", type=int, default=2000)
+    p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--weight_decay", type=float, default=0.0)
+    p.add_argument("--eval_interval", type=int, default=200)
+    p.add_argument("--eval_iters", type=int, default=20)
+    p.add_argument("--val_frac", type=float, default=0.1)
+    # Runtime
+    p.add_argument("--device", default="auto", help="auto | cpu | cuda | cuda:N | mps")
+    p.add_argument("--amp", action="store_true", help="Mixed precision on CUDA")
+    p.add_argument("--compile", action="store_true", help="Enable torch.compile")
+    p.add_argument("--save_every", type=int, default=1,
+                   help="Write a checkpoint every N iterations (default: 1)")
+    args = p.parse_args()
 
-    # Tokenizer
+    out_dir = os.path.dirname(os.path.abspath(args.out))
+    os.makedirs(out_dir, exist_ok=True)
     tok_path = CharTokenizer.default_path(args.out)
-    if args.resume and os.path.exists(tok_path):
-        print("[quick_train] Loading existing tokenizer...")
+
+    # --- tokenizer: reuse on resume so token ids stay stable -------------
+    resuming = args.resume and os.path.exists(args.out) and os.path.exists(tok_path)
+
+    print(f"[quick_train] loading corpus from {args.data} ...")
+    text = load_corpus(args.data, args.pattern)
+
+    if resuming:
+        print("[quick_train] resume: loading existing tokenizer ...")
         tokenizer = CharTokenizer.load(tok_path)
     else:
-        print("[quick_train] Building tokenizer from corpus...")
-        with open(args.data, "r", encoding="utf-8") as f:
-            text = f.read()
+        print("[quick_train] building tokenizer ...")
         tokenizer = CharTokenizer().build(text)
-        os.makedirs(os.path.dirname(os.path.abspath(args.out)) or ".", exist_ok=True)
         tokenizer.save(tok_path)
 
-    # Encode
-    if not args.resume or not os.path.exists(args.out):
-        with open(args.data, "r", encoding="utf-8") as f:
-            text = f.read()
-    else:
-        with open(args.data, "r", encoding="utf-8") as f:
-            text = f.read()
-    tokens = tokenizer.encode(text)
-    train_ds, val_ds = make_splits(tokens, args.block_size, val_fraction=args.val_frac)
+    if len(text) < args.block_size * 2:
+        print(f"[quick_train] corpus too short ({len(text):,} chars), "
+              f"need at least {args.block_size * 2:,}")
+        sys.exit(1)
 
-    # Config
-    model_cfg = GPTConfig(
-        vocab_size=tokenizer.vocab_size,
-        block_size=args.block_size,
-        n_embd=args.n_embd,
-        n_head=args.n_head,
-        n_layer=args.n_layer,
-        dropout=0.0,
-        bias=False,
-    )
+    print("[quick_train] encoding corpus ...")
+    tokens = tokenizer.encode(text)
+    print(f"[quick_train] total tokens: {len(tokens):,}")
+    del text
+
+    train_ds, val_ds = make_splits(tokens, args.block_size, val_fraction=args.val_frac)
+    del tokens
+
+    # --- architecture: inherit from the checkpoint when resuming --------
+    if resuming:
+        from llm.checkpoint import load_checkpoint
+
+        model_cfg = load_checkpoint(args.out)[0]
+        print(f"[quick_train] resume: saved architecture "
+              f"(vocab={model_cfg.vocab_size}, n_layer={model_cfg.n_layer}, "
+              f"n_embd={model_cfg.n_embd}, block_size={model_cfg.block_size})")
+        if model_cfg.vocab_size != tokenizer.vocab_size:
+            print(f"[quick_train] vocab mismatch: model wants "
+                  f"{model_cfg.vocab_size}, tokenizer has {tokenizer.vocab_size}")
+            sys.exit(1)
+    else:
+        model_cfg = GPTConfig(
+            vocab_size=tokenizer.vocab_size,
+            block_size=args.block_size,
+            n_embd=args.n_embd,
+            n_head=args.n_head,
+            n_layer=args.n_layer,
+            dropout=args.dropout,
+            bias=False,
+        )
 
     train_cfg = TrainConfig(
         batch_size=args.batch_size,
-        gradient_accumulation_steps=1,
+        gradient_accumulation_steps=args.grad_accum,
         learning_rate=args.lr,
         max_iters=args.max_iters,
-        weight_decay=0.0,
+        weight_decay=args.weight_decay,
         eval_interval=args.eval_interval,
         eval_iters=args.eval_iters,
+        log_interval=max(1, args.eval_interval // 4 or 1),
         out_path=args.out,
+        device=args.device,
+        amp=args.amp,
+        compile=args.compile,
     )
 
-    # Create custom trainer
-    trainer = FastTrainer(model_cfg, train_cfg, train_ds, val_ds)
+    trainer = Trainer(model_cfg, train_cfg, train_ds, val_ds)
 
-    # Resume if needed
-    if args.resume and os.path.exists(args.out):
-        print(f"[quick_train] Resuming from {args.out}")
-        checkpoint = torch.load(args.out, map_location="cpu", weights_only=False)
-        trainer.model.load_state_dict(checkpoint["model"])
-        trainer.optimizer.load_state_dict(checkpoint["optimizer"])
-        trainer.iter_num = checkpoint["iter_num"]
-        trainer.best_val_loss = checkpoint.get("best_val_loss", float("inf"))
-        if "scheduler" in checkpoint and trainer.scheduler:
-            trainer.scheduler.load_state_dict(checkpoint["scheduler"])
-        print(f"  Resumed at iteration {trainer.iter_num}")
+    if resuming:
+        resume_from(trainer, args.out, args.max_iters)
 
-    # Replace the training step with our auto-save version
-    original_train_step = trainer._train_step
-    def step_with_save(*args, **kwargs):
-        loss = original_train_step(*args, **kwargs)
-        trainer._save_checkpoint(trainer.iter_num, is_best=False)
-        return loss
-    trainer._train_step = step_with_save
+    n_params = sum(q.numel() for q in trainer.model.parameters())
+    print(f"[quick_train] device={describe_device(trainer.device)}  params={n_params:,}")
+    print(f"[quick_train] checkpointing every {args.save_every} iter → {args.out}")
+    print("[quick_train] Ctrl+C is safe: state is already on disk. "
+          "Resume with --resume\n")
 
-    print(f"[quick_train] Starting training for {args.max_iters} iterations...")
-    print(f"  Model size: {sum(p.numel() for p in trainer.model.parameters()):,} params")
-    print(f"  Saving checkpoint to {args.out} after EVERY iteration")
-    print("  Press Ctrl+C to interrupt and resume later with --resume\n")
+    t0 = time.time()
+    trainer.optimizer.zero_grad(set_to_none=True)
+    accum_loss = 0.0
+    accum_count = 0
+    last_save = 0.0
 
     try:
-        trainer.run()
+        while trainer.iter_num < train_cfg.max_iters:
+            lr = get_lr(train_cfg, trainer.iter_num)
+            for group in trainer.optimizer.param_groups:
+                group["lr"] = lr
+
+            if trainer.iter_num % train_cfg.eval_interval == 0:
+                losses = trainer._estimate_loss()
+                elapsed = time.time() - t0
+                done = trainer.iter_num / train_cfg.max_iters * 100
+                print(f"  iter {trainer.iter_num:6d}/{train_cfg.max_iters}  "
+                      f"train={losses['train']:.4f}  val={losses['val']:.4f}  "
+                      f"lr={lr:.2e}  {elapsed:.0f}s  ({done:.0f}%)")
+                if losses["val"] < trainer.best_val_loss:
+                    trainer.best_val_loss = losses["val"]
+                    trainer._save(args.out)
+                    print(f"  ✓ new best (val_loss={trainer.best_val_loss:.4f})")
+
+            for _ in range(train_cfg.gradient_accumulation_steps):
+                x, y = trainer.train_loader.get_batch()
+                x, y = x.to(trainer.device), y.to(trainer.device)
+                _, loss = trainer._forward(x, y)
+                loss = loss / train_cfg.gradient_accumulation_steps
+                trainer.scaler.scale(loss).backward()
+                accum_loss += loss.item()
+                accum_count += 1
+
+            trainer.scaler.unscale_(trainer.optimizer)
+            torch.nn.utils.clip_grad_norm_(trainer.model.parameters(), train_cfg.grad_clip)
+            trainer.scaler.step(trainer.optimizer)
+            trainer.scaler.update()
+            trainer.optimizer.zero_grad(set_to_none=True)
+
+            trainer.iter_num += 1
+
+            # Throttled checkpoint: every N iters, or at least every 60s.
+            now = time.time()
+            due = (trainer.iter_num % args.save_every == 0) or (now - last_save >= 60)
+            if due:
+                trainer._save(args.out)
+                last_save = now
+
+            if trainer.iter_num % train_cfg.log_interval == 0 and trainer.iter_num > 0:
+                # Average, not sum — accumulating raw per-step losses makes the
+                # number scale with log_interval and reads as nonsense.
+                avg = accum_loss / max(1, accum_count)
+                print(f"  iter {trainer.iter_num:6d}  loss={avg:.4f}  lr={lr:.2e}")
+                accum_loss = 0.0
+                accum_count = 0
+
     except KeyboardInterrupt:
-        print("\n[quick_train] Interrupted. Saving final checkpoint...")
-        trainer._save_checkpoint(trainer.iter_num, is_best=False)
+        print("\n[quick_train] interrupted — saving state ...")
+        trainer._save(args.out)
+        print(f"[quick_train] saved at iteration {trainer.iter_num}. "
+              f"Resume with --resume")
         sys.exit(0)
+
+    trainer._save(args.out)
+    print(f"\n[quick_train] done in {time.time() - t0:.0f}s  "
+          f"best val_loss={trainer.best_val_loss:.4f}")
+    print(f"[quick_train] model    → {args.out}")
+    print(f"[quick_train] tokenizer → {tok_path}")
+
 
 if __name__ == "__main__":
     main()

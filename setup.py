@@ -31,6 +31,10 @@ Train options
   --val_frac      Fraction of data for validation (default: 0.1)
   --pattern       Glob pattern when --data is a folder (default: *.txt)
   --no_recurse    Do not recurse into subfolders (flag)
+  --device        auto | cpu | cuda | cuda:N | mps   (default: auto)
+  --amp           Mixed precision on CUDA (flag)
+  --compile       Enable torch.compile (slow first run, flag)
+  --resume        Continue from an existing checkpoint at --out (flag)
 
 Generate options
 ----------------
@@ -45,8 +49,10 @@ Generate options
 Notes
 -----
   * The tokenizer is saved alongside the model as <model_stem>_tokenizer.json
-  * All computation runs on CPU — no GPU required.
-  * Memory usage is kept well below 6 GB for the default hyperparameters.
+  * Runs on CUDA / MPS / CPU — auto-detected by default, so it works on Colab
+    (GPU), Apple Silicon, and a plain laptop with no changes.
+  * Checkpoints are always written as CPU tensors, so a model trained on a
+    Colab GPU loads anywhere.
 """
 
 import sys
@@ -56,8 +62,9 @@ import glob
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import torch
-torch.set_default_device("cpu")
+from llm.compat import enable_safe_output
+
+enable_safe_output()
 
 
 # ---------------------------------------------------------------------------
@@ -141,10 +148,11 @@ def _read_file(path: str, silent: bool = False) -> str:
 # ---------------------------------------------------------------------------
 
 def cmd_train(args: argparse.Namespace) -> None:
-    from llm.model import GPT, GPTConfig
+    from llm.model import GPTConfig
     from llm.tokenizer import CharTokenizer
     from llm.data import make_splits
-    from llm.train import Trainer, TrainConfig
+    from llm.train import Trainer, TrainConfig, resume_from
+    from llm.checkpoint import load_checkpoint
 
     # 1. Load data (file or folder)
     text = load_data_path(args.data, pattern=args.pattern, recurse=not args.no_recurse)
@@ -161,15 +169,24 @@ def cmd_train(args: argparse.Namespace) -> None:
               f"Token tensor will use ~{size_mb * 2:.0f} MB RAM (int16). "
               f"Consider --block_size 256 or --batch_size 4 to save memory.")
 
-    # 2. Build tokenizer from full corpus
-    print("[train] building tokenizer ...")
-    tokenizer = CharTokenizer().build(text)
-    tok_path  = CharTokenizer.default_path(args.out)
-
-    # Make sure output directory exists
+    # Make sure output directory exists before anything writes there
     out_dir = os.path.dirname(os.path.abspath(args.out))
     os.makedirs(out_dir, exist_ok=True)
-    tokenizer.save(tok_path)
+
+    tok_path = CharTokenizer.default_path(args.out)
+
+    # 2. Tokenizer — on resume, reuse the saved one so token ids stay stable.
+    #    Rebuilding from the corpus would reshuffle the vocab and invalidate
+    #    every embedding already learned.
+    resuming = args.resume and os.path.exists(args.out) and os.path.exists(tok_path)
+
+    if resuming:
+        print("[train] resume: loading existing tokenizer ...")
+        tokenizer = CharTokenizer.load(tok_path)
+    else:
+        print("[train] building tokenizer ...")
+        tokenizer = CharTokenizer().build(text)
+        tokenizer.save(tok_path)
 
     # 3. Encode corpus
     print("[train] encoding corpus (this may take a moment for large files) ...")
@@ -183,16 +200,33 @@ def cmd_train(args: argparse.Namespace) -> None:
     train_ds, val_ds = make_splits(tokens, args.block_size, val_fraction=args.val_frac)
     del tokens   # free encoded list; datasets hold int16 tensors
 
-    # 5. Model config
-    model_cfg = GPTConfig(
-        vocab_size = tokenizer.vocab_size,
-        block_size = args.block_size,
-        n_embd     = args.n_embd,
-        n_head     = args.n_head,
-        n_layer    = args.n_layer,
-        dropout    = args.dropout,
-        bias       = False,
-    )
+    # 5. Model config — on resume, inherit the checkpoint's architecture.
+    #    A vocab_size mismatch against the saved tokenizer would throw deep
+    #    inside the embedding lookup, so surface it here instead.
+    if resuming:
+        model_cfg = load_checkpoint(args.out)[0]
+        print(f"[train] resume: using saved architecture "
+              f"(vocab={model_cfg.vocab_size}, n_layer={model_cfg.n_layer}, "
+              f"n_embd={model_cfg.n_embd}, block_size={model_cfg.block_size})")
+        if model_cfg.vocab_size != tokenizer.vocab_size:
+            print(f"[error] Saved model expects vocab_size={model_cfg.vocab_size} "
+                  f"but the tokenizer has {tokenizer.vocab_size}.")
+            print("        The tokenizer and checkpoint are out of sync — "
+                  "start training from scratch instead.")
+            sys.exit(1)
+        if model_cfg.block_size != args.block_size:
+            print(f"[warn] --block_size {args.block_size} differs from the "
+                  f"saved {model_cfg.block_size}; using the saved value.")
+    else:
+        model_cfg = GPTConfig(
+            vocab_size = tokenizer.vocab_size,
+            block_size = args.block_size,
+            n_embd     = args.n_embd,
+            n_head     = args.n_head,
+            n_layer    = args.n_layer,
+            dropout    = args.dropout,
+            bias       = False,
+        )
 
     # 6. Training config
     train_cfg = TrainConfig(
@@ -204,10 +238,17 @@ def cmd_train(args: argparse.Namespace) -> None:
         eval_interval               = args.eval_interval,
         eval_iters                  = args.eval_iters,
         out_path                    = args.out,
+        device                      = args.device,
+        amp                         = args.amp,
+        compile                     = args.compile,
     )
 
     # 7. Train
     trainer = Trainer(model_cfg, train_cfg, train_ds, val_ds)
+
+    if resuming:
+        resume_from(trainer, args.out, args.max_iters)
+
     trainer.run()
 
 
@@ -220,17 +261,20 @@ def cmd_generate(args: argparse.Namespace) -> None:
     from llm.tokenizer import CharTokenizer
     from llm.generate import generate, stream_generate
 
-    tok_path = CharTokenizer.default_path(args.model)
-    if not os.path.exists(tok_path):
-        print(f"[error] Tokenizer not found at '{tok_path}'.")
-        print("        The tokenizer JSON must be in the same folder as the model.")
-        sys.exit(1)
-    tokenizer = CharTokenizer.load(tok_path)
-
+    # Check the model exists *before* touching the tokenizer — otherwise a bad
+    # --model path reports a confusing "tokenizer not found" error instead.
     if not os.path.exists(args.model):
         print(f"[error] Model file not found: '{args.model}'")
         sys.exit(1)
-    model = GPT.load(args.model)
+
+    tok_path = CharTokenizer.default_path(args.model)
+    if not os.path.exists(tok_path):
+        print(f"[error] Tokenizer not found at '{tok_path}'.")
+        print("        The tokenizer JSON must sit beside the model file.")
+        sys.exit(1)
+    tokenizer = CharTokenizer.load(tok_path)
+
+    model = GPT.load(args.model, device=args.device)
 
     print(f"\n[generate] prompt     : {args.prompt!r}")
     print(f"[generate] temperature: {args.temperature}  "
@@ -266,7 +310,7 @@ def cmd_generate(args: argparse.Namespace) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python setup.py",
-        description="Shimba LLM — tiny decoder-only transformer (CPU)",
+        description="Shimba LLM — tiny decoder-only transformer (CPU / CUDA / MPS)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -297,6 +341,15 @@ def build_parser() -> argparse.ArgumentParser:
     t.add_argument("--eval_interval", type=int,   default=500)
     t.add_argument("--eval_iters",    type=int,   default=100)
     t.add_argument("--val_frac",      type=float, default=0.1)
+    # Runtime
+    t.add_argument("--device",        default="auto",
+                   help="auto | cpu | cuda | cuda:N | mps (default: auto)")
+    t.add_argument("--amp",           action="store_true",
+                   help="Mixed precision on CUDA (bf16/fp16)")
+    t.add_argument("--compile",       action="store_true",
+                   help="Enable torch.compile (first run is slow)")
+    t.add_argument("--resume",        action="store_true",
+                   help="Continue training from an existing checkpoint at --out")
 
     # ── generate ─────────────────────────────────────────────────────
     g = sub.add_parser("generate", help="Generate text from a trained model")
@@ -307,6 +360,8 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--top_k",       type=int,   default=40)
     g.add_argument("--top_p",       type=float, default=0.95)
     g.add_argument("--stream",      action="store_true")
+    g.add_argument("--device",      default="auto",
+                   help="auto | cpu | cuda | cuda:N | mps (default: auto)")
 
     # ── help ─────────────────────────────────────────────────────────
     sub.add_parser("help", help="Show detailed help")
@@ -328,10 +383,16 @@ def main() -> None:
         print("  python setup.py train --data corpus.txt --out model.pth")
         print()
         print("  # entire folder of .txt files")
-        print("  python setup.py train --data cuad\\CUAD_v1\\full_contract_txt\\Part_I --out model.pth")
+        print("  python setup.py train --data ./texts --out model.pth")
+        print()
+        print("  # Colab GPU, mixed precision")
+        print("  python setup.py train --data corpus.txt --out model.pth --amp")
+        print()
+        print("  # resume an interrupted run")
+        print("  python setup.py train --data corpus.txt --out model.pth --resume")
         print()
         print("  # generate")
-        print("  python setup.py generate --model model.pth --prompt \"This agreement\"")
+        print('  python setup.py generate --model model.pth --prompt "This agreement"')
         sys.exit(0)
 
     args = parser.parse_args()

@@ -14,7 +14,10 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from llm.model import GPT, GPTConfig
+from llm.model import GPT
+from llm.compat import enable_safe_output
+
+enable_safe_output()
 
 def quantize_int8(model: torch.nn.Module) -> torch.nn.Module:
     from torch.quantization import quantize_dynamic
@@ -36,26 +39,9 @@ def main():
         sys.exit(1)
 
     print(f"[quantize] Loading {args.model} ...")
-    checkpoint = torch.load(args.model, map_location="cpu", weights_only=False)
-    
-    # Handle both possible key names: 'model' or 'state_dict'
-    if "config" not in checkpoint:
-        print("[error] Checkpoint missing 'config' key.")
-        sys.exit(1)
-    
-    # Get the state dict from either 'model' or 'state_dict'
-    if "model" in checkpoint:
-        state_dict = checkpoint["model"]
-    elif "state_dict" in checkpoint:
-        state_dict = checkpoint["state_dict"]
-    else:
-        print("[error] Checkpoint has no 'model' or 'state_dict' key.")
-        sys.exit(1)
-    
-    cfg = checkpoint["config"]
-    model = GPT(cfg)
-    model.load_state_dict(state_dict)
-    model.eval()
+    # GPT.load handles every historical checkpoint layout (weights under
+    # "model"/"weights", _orig_mod-prefixed keys from torch.compile).
+    model = GPT.load(args.model)
 
     print(f"[quantize] Applying {args.dtype} quantization ...")
     if args.dtype == "int8":
@@ -63,12 +49,10 @@ def main():
     else:  # float16
         quantized_model = quantize_float16(model)
 
-    # Save with consistent keys (using 'config' and 'model' for compatibility)
-    new_checkpoint = {
-        "config": cfg,
-        "model": quantized_model.state_dict(),
-    }
-    torch.save(new_checkpoint, args.out)
+    # Save with consistent keys (using 'config' and 'state_dict' for compatibility)
+    # Note: an int8-quantised module's state_dict can only be loaded back into
+    # another quantised model, so the tokenizer path is carried over unchanged.
+    torch.save({"config": model.cfg, "state_dict": quantized_model.state_dict()}, args.out)
     print(f"[quantize] Saved quantized model to {args.out}")
 
     # Show size reduction

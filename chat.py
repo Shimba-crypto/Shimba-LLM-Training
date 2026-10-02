@@ -17,13 +17,24 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from llm.model import GPT
 from llm.tokenizer import CharTokenizer
 from llm.generate import generate
+from llm.compat import enable_safe_output
+
+enable_safe_output()
 
 class ChatSession:
-    def __init__(self, model, tokenizer, max_history_tokens=1024, temperature=0.8, top_k=40, top_p=0.95, max_new_tokens=200):
+    def __init__(self, model, tokenizer, max_history_tokens=1024, temperature=0.8, top_k=40, top_p=0.95, max_new_tokens=200, temperature_ramp=0.0):
         self.model = model
         self.tokenizer = tokenizer
+        # The model asserts seq_len <= block_size, so a larger history budget
+        # would crash generation rather than simply be ignored.
+        block_size = model.cfg.block_size
+        if max_history_tokens > block_size:
+            print(f"[chat] --max_history {max_history_tokens} exceeds the model's "
+                  f"context window ({block_size}); clamping.")
+            max_history_tokens = block_size
         self.max_history_tokens = max_history_tokens
         self.temperature = temperature
+        self.temperature_ramp = temperature_ramp
         self.top_k = top_k
         self.top_p = top_p
         self.max_new_tokens = max_new_tokens
@@ -43,6 +54,8 @@ class ChatSession:
         tokens = self.tokenizer.encode(prompt)
         if len(tokens) <= self.max_history_tokens:
             return prompt
+        # Keep the most recent window, then drop the partial leading turn so
+        # the model doesn't start mid-word.
         trimmed_tokens = tokens[-self.max_history_tokens:]
         trimmed = self.tokenizer.decode(trimmed_tokens)
         idx = trimmed.find("\n", trimmed.rfind("."))
@@ -54,10 +67,16 @@ class ChatSession:
         self.history.append(("user", user_input.strip()))
         prompt = self._build_prompt()
         prompt = self._trim_history(prompt)
+
+        # Gradually warmer as the conversation goes on, if enabled.
+        temp = self.temperature
+        if self.temperature_ramp:
+            temp = min(1.5, self.temperature + self.temperature_ramp * (len(self.history) // 2))
+
         response = generate(
             self.model, self.tokenizer, prompt,
             max_new_tokens=self.max_new_tokens,
-            temperature=self.temperature,
+            temperature=temp,
             top_k=self.top_k,
             top_p=self.top_p,
         )
@@ -77,40 +96,29 @@ def main():
     parser.add_argument("--top_p", type=float, default=0.95, help="Nucleus sampling")
     parser.add_argument("--max_tokens", type=int, default=200, help="Max new tokens per response")
     parser.add_argument("--max_history", type=int, default=1024, help="Max tokens to keep in conversation history")
+    parser.add_argument("--device", default="auto", help="auto | cpu | cuda | cuda:N | mps")
+    parser.add_argument("--temperature_ramp", type=float, default=0.0,
+                        help="Per-turn temperature increase; 0 disables (recommended for "
+                             "a char-level model, which drifts fast at high temperature)")
     args = parser.parse_args()
 
-    # Load tokenizer (assumes same naming convention)
-    tok_path = CharTokenizer.default_path(args.model)
-    if not os.path.exists(tok_path):
-        print(f"[error] Tokenizer not found at {tok_path}")
-        sys.exit(1)
-    tokenizer = CharTokenizer.load(tok_path)
-
-    # Load model
+    # Check the model exists before the tokenizer, so a bad path names the
+    # actual problem.
     if not os.path.exists(args.model):
         print(f"[error] Model file not found: {args.model}")
         sys.exit(1)
+
+    tok_path = CharTokenizer.default_path(args.model)
+    if not os.path.exists(tok_path):
+        print(f"[error] Tokenizer not found at {tok_path}")
+        print("        The tokenizer JSON must sit beside the model file.")
+        sys.exit(1)
+    tokenizer = CharTokenizer.load(tok_path)
+
     print(f"[chat] Loading model from {args.model} ...")
-    
-    # Custom load that handles both 'state_dict' and 'model' keys
-    checkpoint = torch.load(args.model, map_location="cpu", weights_only=False)
-    if "config" not in checkpoint:
-        print("[error] Checkpoint missing 'config' key")
-        sys.exit(1)
-    
-    # Try to get state dict from either 'model' or 'state_dict'
-    if "state_dict" in checkpoint:
-        state_dict = checkpoint["state_dict"]
-    elif "model" in checkpoint:
-        state_dict = checkpoint["model"]
-    else:
-        print("[error] Checkpoint has no 'state_dict' or 'model' key")
-        sys.exit(1)
-    
-    cfg = checkpoint["config"]
-    model = GPT(cfg)
-    model.load_state_dict(state_dict)
-    model.eval()
+    # GPT.load handles every historical checkpoint layout, including weights
+    # saved under "model" and keys prefixed by torch.compile.
+    model = GPT.load(args.model, device=args.device)
 
     # Create chat session
     chat = ChatSession(
@@ -120,6 +128,7 @@ def main():
         top_k=args.top_k,
         top_p=args.top_p,
         max_new_tokens=args.max_tokens,
+    temperature_ramp=args.temperature_ramp,
     )
 
     print("\n" + "="*60)

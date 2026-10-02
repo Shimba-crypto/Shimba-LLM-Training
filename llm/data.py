@@ -40,9 +40,16 @@ class TextDataset:
     """
 
     def __init__(self, tokens: list, block_size: int):
-        # int16 saves RAM (vocab_size for char-level << 32767)
+        # int16 halves RAM vs int64. Guard the boundary: a very large corpus can
+        # push vocab_size past 32767 (heavy multilingual text), and silently
+        # wrapping to negative ids would corrupt every embedding lookup.
+        if tokens and max(tokens) > 32767:
+            print("[data] vocab exceeds int16 range — storing as int32")
+            dtype = torch.int32
+        else:
+            dtype = torch.int16
         # We cast to int64 on __getitem__ so embedding layers work.
-        self.data       = torch.tensor(tokens, dtype=torch.int16)
+        self.data       = torch.tensor(tokens, dtype=dtype)
         self.block_size = block_size
 
     def __len__(self) -> int:
