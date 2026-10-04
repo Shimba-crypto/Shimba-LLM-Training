@@ -218,8 +218,8 @@ def cmd_train(args: argparse.Namespace) -> None:
             model_cfg = load_checkpoint(args.out)[0]
         except Exception as e:
             print(f"[error] checkpoint at '{args.out}' is unreadable ({e}).")
-            print("        Delete the .pth to start over (the tokenizer file "
-                  "is reused, not rebuilt).")
+            print("        Delete the .pth to start over (the tokenizer "
+                  "rebuilds once, then training runs).")
             sys.exit(1)
         print(f"[train] resume: using saved architecture "
               f"(arch={getattr(model_cfg, 'arch', 'shimba')}, "

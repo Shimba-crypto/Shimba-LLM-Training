@@ -141,7 +141,7 @@ def main():
             print(f"[error] checkpoint at '{args.out}' is unreadable ({e}).")
             print("        It was likely truncated by a kill during saving "
                   "(versions before atomic saves). Delete the .pth to start "
-                  "over — the tokenizer file is reused, not rebuilt.")
+                  "over — the tokenizer rebuilds once, then training runs.")
             sys.exit(1)
         print(f"[quick_train] resume: saved architecture "
               f"(arch={getattr(model_cfg, 'arch', 'shimba')}, "
