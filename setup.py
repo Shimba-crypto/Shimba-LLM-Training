@@ -6,16 +6,22 @@ Usage
 -----
   python setup.py train    --data <file.txt>        --out <model.pth> [options]
   python setup.py train    --data <folder/>          --out <model.pth> [options]
+  python setup.py train    --data data.jsonl         --out <model.pth> [options]
   python setup.py generate --prompt "..." --model <model.pth> [options]
+  python setup.py merge    --models a.pth b.pth --out merged.pth [options]
+  python setup.py gguf     --model model.pth --out model.gguf [options]
   python setup.py help
 
-When --data points to a FOLDER, all .txt files inside it are merged
-(recursively) into one corpus before training.
+When --data points to a FOLDER, all matching files inside it are merged
+(recursively) into one corpus before training. Each file is parsed by its
+extension: .txt as raw text, .json as a JSON array/object, .jsonl as one
+JSON value per line (non-JSON lines are kept as plain text).
 
 Train options
 -------------
-  --data          Path to a .txt file OR a folder of .txt files (required)
+  --data          Path to a .txt/.json/.jsonl file OR a folder of them (required)
   --out           Output model path (default: model.pth)
+  --arch          shimba | gpt2 | llama (default: shimba)
   --block_size    Context window length          (default: 512)
   --n_embd        Embedding dimension            (default: 256)
   --n_head        Number of attention heads      (default: 4)
@@ -29,7 +35,9 @@ Train options
   --eval_iters    Batches per eval               (default: 100)
   --weight_decay  AdamW weight decay             (default: 0.1)
   --val_frac      Fraction of data for validation (default: 0.1)
-  --pattern       Glob pattern when --data is a folder (default: *.txt)
+  --text_field    JSON field(s) to train on, comma-separated (default: auto-detect)
+  --format        Corpus parser: auto | txt | json | jsonl (default: auto)
+  --pattern       Glob pattern(s) when --data is a folder (default: *.txt,*.json,*.jsonl)
   --no_recurse    Do not recurse into subfolders (flag)
   --device        auto | cpu | cuda | cuda:N | mps   (default: auto)
   --amp           Mixed precision on CUDA (flag)
@@ -45,6 +53,23 @@ Generate options
   --top_k         Top-k sampling            (default: 40)
   --top_p         Nucleus sampling p        (default: 0.95)
   --stream        Stream output token-by-token (flag)
+
+Merge options
+-------------
+  --models        Two or more input .pth files (required)
+  --out           Output merged .pth path (required)
+  --method        average | slerp (default: average)
+  --weights       Per-model weights for average (default: equal)
+  --t             Interpolation factor for slerp (default: 0.5)
+  --tokenizer-from  Which input supplies the tokenizer (default: 0)
+
+GGUF options
+------------
+  --model         Input model .pth file (required)
+  --out           Output .gguf path (required)
+  --outtype       f32 | f16 | q8_0 (default: f32)
+  --compat        auto | none | gpt2 | llama (default: auto follows checkpoint)
+  --name          Model name for metadata (default: input stem)
 
 Notes
 -----
@@ -68,66 +93,39 @@ enable_safe_output()
 
 
 # ---------------------------------------------------------------------------
-# Folder → merged corpus loader
+# Folder → merged corpus loader (.txt / .json / .jsonl)
 # ---------------------------------------------------------------------------
 
-def load_data_path(data_path: str, pattern: str = "*.txt", recurse: bool = True) -> str:
+def load_data_path(data_path: str, pattern: str = "*.txt,*.json,*.jsonl",
+                   recurse: bool = True, text_field=None,
+                   data_format: str = "auto") -> str:
     """
     Load text from:
-      - a single .txt file, OR
+      - a single .txt / .json / .jsonl file, OR
       - a directory: merges all files matching `pattern` (optionally recursive)
+
+    `pattern` accepts comma-separated globs (default covers all three
+    extensions). `text_field` names JSON object field(s) to read first.
+    `data_format` forces one parser ("auto" detects from the extension).
 
     Returns the combined text string.
     """
-    if os.path.isfile(data_path):
-        return _read_file(data_path)
+    from llm.corpus import load_corpus_text
 
-    if os.path.isdir(data_path):
-        # Collect matching files
-        if recurse:
-            matches = []
-            for root, dirs, files in os.walk(data_path):
-                # Sort for deterministic ordering
-                dirs.sort()
-                for fname in sorted(files):
-                    if _matches_pattern(fname, pattern):
-                        matches.append(os.path.join(root, fname))
-        else:
-            matches = sorted(glob.glob(os.path.join(data_path, pattern)))
-
-        if not matches:
-            print(f"[error] No files matching '{pattern}' found in '{data_path}'")
-            sys.exit(1)
-
-        print(f"[data] found {len(matches)} file(s) in '{data_path}'")
-
-        # Read and concatenate with a separator so docs don't bleed together
-        sep = "\n\n" + "=" * 60 + "\n\n"
-        parts = []
-        total_bytes = 0
-        for i, fpath in enumerate(matches, 1):
-            text = _read_file(fpath, silent=True)
-            if text.strip():          # skip empty files
-                parts.append(text)
-                total_bytes += len(text)
-            # Progress every 20 files
-            if i % 20 == 0 or i == len(matches):
-                print(f"  loaded {i}/{len(matches)} files  "
-                      f"({total_bytes / 1_000_000:.1f} MB so far)")
-
-        combined = sep.join(parts)
-        print(f"[data] total corpus: {len(combined):,} characters "
-              f"across {len(parts)} file(s)")
-        return combined
-
-    print(f"[error] --data path does not exist: '{data_path}'")
-    sys.exit(1)
+    return load_corpus_text(
+        data_path,
+        pattern=pattern,
+        recurse=recurse,
+        text_field=text_field,
+        data_format=data_format,
+    )
 
 
 def _matches_pattern(filename: str, pattern: str) -> bool:
-    """Simple glob-style match on filename only (not full path)."""
-    import fnmatch
-    return fnmatch.fnmatch(filename.lower(), pattern.lower())
+    """Glob-style match on filename only; `pattern` may be comma-separated."""
+    from llm.corpus import matches_any, split_patterns
+
+    return matches_any(filename, split_patterns(pattern))
 
 
 def _read_file(path: str, silent: bool = False) -> str:
@@ -154,8 +152,9 @@ def cmd_train(args: argparse.Namespace) -> None:
     from llm.train import Trainer, TrainConfig, resume_from
     from llm.checkpoint import load_checkpoint
 
-    # 1. Load data (file or folder)
-    text = load_data_path(args.data, pattern=args.pattern, recurse=not args.no_recurse)
+    # 1. Load data (file or folder; .txt / .json / .jsonl)
+    text = load_data_path(args.data, pattern=args.pattern, recurse=not args.no_recurse,
+                          text_field=args.text_field, data_format=args.format)
 
     if len(text) < args.block_size * 2:
         print(f"[error] Corpus too short ({len(text):,} chars). "
@@ -182,7 +181,18 @@ def cmd_train(args: argparse.Namespace) -> None:
 
     if resuming:
         print("[train] resume: loading existing tokenizer ...")
-        tokenizer = CharTokenizer.load(tok_path)
+        from llm.bpe import load_tokenizer
+        tokenizer = load_tokenizer(tok_path)
+        saved_kind = getattr(tokenizer, "TYPE", "char")
+        if saved_kind != args.tokenizer:
+            print(f"[error] Saved tokenizer is '{saved_kind}' but --tokenizer "
+                  f"is '{args.tokenizer}'. Resume with the matching kind.")
+            sys.exit(1)
+    elif args.tokenizer == "bpe":
+        from llm.bpe import BPETokenizer
+        print("[train] training BPE tokenizer ...")
+        tokenizer = BPETokenizer().build(text, vocab_size=args.vocab_size)
+        tokenizer.save(tok_path)
     else:
         print("[train] building tokenizer ...")
         tokenizer = CharTokenizer().build(text)
@@ -206,13 +216,19 @@ def cmd_train(args: argparse.Namespace) -> None:
     if resuming:
         model_cfg = load_checkpoint(args.out)[0]
         print(f"[train] resume: using saved architecture "
-              f"(vocab={model_cfg.vocab_size}, n_layer={model_cfg.n_layer}, "
+              f"(arch={getattr(model_cfg, 'arch', 'shimba')}, "
+              f"vocab={model_cfg.vocab_size}, n_layer={model_cfg.n_layer}, "
               f"n_embd={model_cfg.n_embd}, block_size={model_cfg.block_size})")
         if model_cfg.vocab_size != tokenizer.vocab_size:
             print(f"[error] Saved model expects vocab_size={model_cfg.vocab_size} "
                   f"but the tokenizer has {tokenizer.vocab_size}.")
             print("        The tokenizer and checkpoint are out of sync — "
                   "start training from scratch instead.")
+            sys.exit(1)
+        if getattr(model_cfg, "arch", "shimba") != args.arch:
+            print(f"[error] Saved model is arch "
+                  f"'{getattr(model_cfg, 'arch', 'shimba')}' but --arch is "
+                  f"'{args.arch}'. Resume with the matching --arch.")
             sys.exit(1)
         if model_cfg.block_size != args.block_size:
             print(f"[warn] --block_size {args.block_size} differs from the "
@@ -225,7 +241,8 @@ def cmd_train(args: argparse.Namespace) -> None:
             n_head     = args.n_head,
             n_layer    = args.n_layer,
             dropout    = args.dropout,
-            bias       = False,
+            bias       = args.arch == "gpt2",
+            arch       = args.arch,
         )
 
     # 6. Training config
@@ -267,12 +284,20 @@ def cmd_generate(args: argparse.Namespace) -> None:
         print(f"[error] Model file not found: '{args.model}'")
         sys.exit(1)
 
-    tok_path = CharTokenizer.default_path(args.model)
-    if not os.path.exists(tok_path):
+    from llm.scw import load_tokenizer_for
+    from llm.tokenizer import CharTokenizer
+    if args.model.endswith(".scw") or os.path.exists(
+            CharTokenizer.default_path(args.model)):
+        try:
+            tokenizer = load_tokenizer_for(args.model)
+        except (FileNotFoundError, ValueError) as e:
+            print(f"[error] {e}")
+            sys.exit(1)
+    else:
+        tok_path = CharTokenizer.default_path(args.model)
         print(f"[error] Tokenizer not found at '{tok_path}'.")
         print("        The tokenizer JSON must sit beside the model file.")
         sys.exit(1)
-    tokenizer = CharTokenizer.load(tok_path)
 
     model = GPT.load(args.model, device=args.device)
 
@@ -304,6 +329,128 @@ def cmd_generate(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Sub-command: merge
+# ---------------------------------------------------------------------------
+
+def cmd_merge(args: argparse.Namespace) -> None:
+    import copy
+    import torch
+
+    from llm.checkpoint import FORMAT_VERSION
+    from llm.model import GPT
+    from merge import (
+        _check_compatible,
+        _check_mergeable,
+        _load_state,
+        _load_tokenizer_data,
+        _tokenizer_path,
+        _vocab_key,
+        merge_average,
+        merge_slerp,
+    )
+
+    if len(args.models) < 2:
+        print("[error] Need at least 2 --models to merge.")
+        sys.exit(1)
+    for m in args.models:
+        if not os.path.exists(m):
+            print(f"[error] Model not found: {m}")
+            sys.exit(1)
+
+    if args.method == "average":
+        weights = args.weights if args.weights is not None else [1.0] * len(args.models)
+        if len(weights) != len(args.models):
+            print(f"[error] Got {len(weights)} --weights for "
+                  f"{len(args.models)} --models.")
+            sys.exit(1)
+    else:
+        weights = None
+
+    cfgs, sds = [], []
+    for m in args.models:
+        cfg, sd = _load_state(m)
+        try:
+            _check_mergeable(sd, m)
+        except ValueError as e:
+            print(f"[error] {e}")
+            sys.exit(1)
+        cfgs.append(cfg)
+        sds.append(sd)
+
+    try:
+        _check_compatible(cfgs)
+    except ValueError as e:
+        print(f"[error] {e}")
+        sys.exit(1)
+
+    try:
+        tok_datas = [_load_tokenizer_data(m) for m in args.models]
+    except FileNotFoundError as e:
+        print(f"[error] {e}")
+        sys.exit(1)
+    ref_data = tok_datas[args.tokenizer_from]
+    ref_key = _vocab_key(ref_data)
+    mismatch = [i for i, d in enumerate(tok_datas)
+                if _vocab_key(d) != ref_key]
+    if mismatch and not args.allow_different_tokenizer:
+        print(f"[error] Tokenizers differ between model {args.tokenizer_from} "
+              f"and model(s) {mismatch}.")
+        sys.exit(1)
+
+    if args.method == "slerp":
+        try:
+            merged_sd = merge_slerp(sds, args.t)
+        except ValueError as e:
+            print(f"[error] {e}")
+            sys.exit(1)
+    else:
+        assert weights is not None
+        merged_sd = merge_average(sds, weights)
+
+    out_dir = os.path.dirname(os.path.abspath(args.out))
+    os.makedirs(out_dir, exist_ok=True)
+    payload = {
+        "format_version": FORMAT_VERSION,
+        "config": copy.deepcopy(cfgs[0]),
+        "state_dict": merged_sd,
+        "merge_method": args.method,
+        "merge_models": list(args.models),
+    }
+    torch.save(payload, args.out)
+    print(f"[merge] saved → {args.out}")
+
+    import shutil
+    out_tok = CharTokenizer_default_path(args.out)
+    shutil.copy2(_tokenizer_path(args.models[args.tokenizer_from]), out_tok)
+    print(f"[merge] tokenizer → {out_tok}")
+    GPT.load(args.out)
+    print("[merge] verified: reload OK")
+
+
+def CharTokenizer_default_path(model_path: str) -> str:
+    from llm.tokenizer import CharTokenizer
+    return CharTokenizer.default_path(model_path)
+
+
+# ---------------------------------------------------------------------------
+# Sub-command: gguf
+# ---------------------------------------------------------------------------
+
+def cmd_gguf(args: argparse.Namespace) -> None:
+    from pth2gguf import convert
+
+    try:
+        convert(args.model, args.out, args.outtype, args.name, args.compat)
+    except (FileNotFoundError, ValueError) as e:
+        print(f"[error] {e}")
+        sys.exit(1)
+    src = os.path.getsize(args.model) / (1024 * 1024)
+    dst = os.path.getsize(args.out) / (1024 * 1024)
+    print(f"[gguf] {args.model} → {args.out} [{args.outtype}/{args.compat}]")
+    print(f"[gguf] Size: {src:.2f} MB → {dst:.2f} MB ({dst / src * 100:.1f}%)")
+
+
+# ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
 
@@ -319,14 +466,29 @@ def build_parser() -> argparse.ArgumentParser:
     # ── train ────────────────────────────────────────────────────────
     t = sub.add_parser("train", help="Train a new model on text file(s)")
     t.add_argument("--data",          required=True,
-                   help="Path to a .txt file OR a folder containing .txt files")
+                   help="Path to a .txt/.json/.jsonl file OR a folder of them")
     t.add_argument("--out",           default="model.pth",
                    help="Output model path (default: model.pth)")
-    t.add_argument("--pattern",       default="*.txt",
-                   help="File glob pattern when --data is a folder (default: *.txt)")
+    t.add_argument("--pattern",       default="*.txt,*.json,*.jsonl",
+                   help="Comma-separated glob(s) when --data is a folder "
+                        "(default: *.txt,*.json,*.jsonl)")
+    t.add_argument("--text_field",    default=None,
+                   help="JSON field(s) to train on, comma-separated "
+                        "(default: auto-detect)")
+    t.add_argument("--format",        default="auto",
+                   choices=["auto", "txt", "json", "jsonl"],
+                   help="Corpus parser (default: auto-detect from extension)")
     t.add_argument("--no_recurse",    action="store_true",
                    help="Do not search subfolders (top-level only)")
+    t.add_argument("--tokenizer",     default="char",
+                   choices=["char", "bpe"],
+                   help="Tokenizer: char (default) or byte-level BPE")
+    t.add_argument("--vocab-size",    type=int, default=2000,
+                   help="BPE vocabulary size target (default: 2000)")
     # Model
+    t.add_argument("--arch",          default="shimba",
+                   choices=["shimba", "gpt2", "llama"],
+                   help="Block architecture (default: shimba)")
     t.add_argument("--block_size",    type=int,   default=512)
     t.add_argument("--n_embd",        type=int,   default=256)
     t.add_argument("--n_head",        type=int,   default=4)
@@ -351,7 +513,7 @@ def build_parser() -> argparse.ArgumentParser:
     t.add_argument("--resume",        action="store_true",
                    help="Continue training from an existing checkpoint at --out")
 
-    # ── generate ─────────────────────────────────────────────────────
+        # ── generate ─────────────────────────────────────────────────────
     g = sub.add_parser("generate", help="Generate text from a trained model")
     g.add_argument("--prompt",      required=True)
     g.add_argument("--model",       required=True)
@@ -362,6 +524,30 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--stream",      action="store_true")
     g.add_argument("--device",      default="auto",
                    help="auto | cpu | cuda | cuda:N | mps (default: auto)")
+
+    # ── merge ────────────────────────────────────────────────────────
+    m = sub.add_parser("merge", help="Merge two or more checkpoints into one")
+    m.add_argument("--models", nargs="+", required=True,
+                   help="Two or more input .pth files")
+    m.add_argument("--out", required=True, help="Output merged .pth path")
+    m.add_argument("--method", choices=["average", "slerp"], default="average")
+    m.add_argument("--weights", nargs="+", type=float, default=None,
+                   help="Per-model weights for average (default: equal)")
+    m.add_argument("--t", type=float, default=0.5,
+                   help="Interpolation factor for slerp (default: 0.5)")
+    m.add_argument("--tokenizer-from", type=int, default=0)
+    m.add_argument("--allow-different-tokenizer", action="store_true")
+
+    # ── gguf ─────────────────────────────────────────────────────────
+    u = sub.add_parser("gguf", help="Convert a .pth checkpoint to GGUF")
+    u.add_argument("--model", required=True, help="Input model .pth file")
+    u.add_argument("--out", required=True, help="Output .gguf path")
+    u.add_argument("--outtype", choices=["f32", "f16", "q8_0"], default="f32")
+    u.add_argument("--compat", choices=["auto", "none", "gpt2", "llama"],
+                   default="auto",
+                   help="GGUF architecture (default: auto follows checkpoint)")
+    u.add_argument("--name", default=None,
+                   help="Model name for GGUF metadata (default: input stem)")
 
     # ── help ─────────────────────────────────────────────────────────
     sub.add_parser("help", help="Show detailed help")
@@ -393,6 +579,12 @@ def main() -> None:
         print()
         print("  # generate")
         print('  python setup.py generate --model model.pth --prompt "This agreement"')
+        print()
+        print("  # merge two checkpoints")
+        print("  python setup.py merge --models a.pth b.pth --out merged.pth")
+        print()
+        print("  # convert to GGUF")
+        print("  python setup.py gguf --model model.pth --out model.gguf --outtype q8_0")
         sys.exit(0)
 
     args = parser.parse_args()
@@ -401,6 +593,10 @@ def main() -> None:
         cmd_train(args)
     elif args.command == "generate":
         cmd_generate(args)
+    elif args.command == "merge":
+        cmd_merge(args)
+    elif args.command == "gguf":
+        cmd_gguf(args)
     elif args.command == "help":
         parser.print_help()
         print("\n" + __doc__)

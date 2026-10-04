@@ -129,8 +129,8 @@ print("Drive mounted")
 md(r"""
 ## 3. Configure
 
-Edit `CORPUS_PATH` to point at your text. A `.txt` file, or a **folder** of
-`.txt` files which get merged in sorted order.
+Edit `CORPUS_PATH` to point at your text: a `.txt`, `.json` or `.jsonl`
+file, or a **folder** of them which get merged in sorted order.
 
 Not sure what to use? Leave `CORPUS_PATH = None` and the next cell generates
 a small sample corpus so you can confirm the whole pipeline works first.
@@ -142,6 +142,14 @@ REPO_DIR   = "/content/shimba-llm"
 DATA_DIR   = "/content/drive/MyDrive/shimba"     # corpus + checkpoints live here
 RUN_NAME   = "shimba_run1"                       # change to start a fresh model
 CORPUS_PATH = None                               # e.g. DATA_DIR + "/corpus.txt"
+
+# Tokenizer: "char" (default, one id per character) or "bpe" (subwords,
+# longer effective context; needs VOCAB_SIZE below).
+TOKENIZER = "char"
+VOCAB_SIZE = 2000     # BPE vocabulary target (ignored for char)
+
+# Block architecture: "shimba" (default), "gpt2" or "llama".
+ARCH = "shimba"
 
 # Model size — bigger = slower, more capacity.
 #   tiny   ~0.4M params   fast, good for a first run
@@ -179,14 +187,17 @@ print("Data dir ready:", DATA_DIR)
 md(r"""
 ## 4. Get a corpus
 
-Pick **one** of the three options below.
+Pick **one** of the options below. `.json` and `.jsonl` work wherever
+`.txt` does — each JSON document becomes one training document.
 
-**A — Google Drive:** drop a `.txt` (or a folder of them) into `shimba/` in
+**A — Google Drive:** drop a file (or a folder of them) into `shimba/` in
 Drive, then set `CORPUS_PATH` above.
 
 **B — Upload:** run the next cell and choose a file from your computer.
 
 **C — URL:** for public domain books, Project Gutenberg is a good source.
+
+**D — HuggingFace:** download a dataset file directly (JSONL included).
 """)
 
 code(r'''
@@ -217,6 +228,20 @@ if URL:
     import urllib.request
     CORPUS_PATH = f"{DATA_DIR}/corpus.txt"
     urllib.request.urlretrieve(URL, CORPUS_PATH)
+    print("downloaded ->", CORPUS_PATH)
+''')
+
+code(r'''
+# ── D: HuggingFace dataset file (optional) ─────────────────────────
+# Example: SupraThink thinking traces (500 rows of conversations with
+# <|begin_of_thought|>...<|end_of_thought|> reasoning, JSONL, Apache-2.0).
+# HF_URL = "https://huggingface.co/datasets/SupraLabs/SupraThink-Dataset-500x/resolve/main/data.jsonl"
+
+HF_URL = None
+if HF_URL:
+    import urllib.request
+    CORPUS_PATH = f"{DATA_DIR}/" + HF_URL.rsplit("/", 1)[-1]
+    urllib.request.urlretrieve(HF_URL, CORPUS_PATH)
     print("downloaded ->", CORPUS_PATH)
 ''')
 
@@ -259,6 +284,8 @@ cmd = [
     "python", "-u", "quick_train.py",
     "--data",  CORPUS_PATH,
     "--out",   MODEL_PATH,
+    "--tokenizer", TOKENIZER,
+    "--arch",  ARCH,
     "--device", "cuda" if DEVICE.type == "cuda" else "cpu",
     "--max_iters",    str(CFG["max_iters"]),
     "--lr",           str(CFG["lr"]),
@@ -272,6 +299,8 @@ cmd = [
     "--eval_iters",   str(CFG["eval_iters"]),
     "--save_every",   "50",
 ]
+if TOKENIZER == "bpe":
+    cmd += ["--vocab-size", str(VOCAB_SIZE)]
 if CFG["amp"]:
     cmd.append("--amp")
 if os.path.exists(MODEL_PATH):
@@ -299,10 +328,11 @@ Lower `temperature` for repetitive-but-plausible text, raise it for noise.
 code(r'''
 import torch
 from llm.model import GPT
+from llm.bpe import load_tokenizer
 from llm.tokenizer import CharTokenizer
-from llm.generate import generate
+from llm.generate import generate, split_thinking
 
-tok = CharTokenizer.load(CharTokenizer.default_path(MODEL_PATH))
+tok = load_tokenizer(CharTokenizer.default_path(MODEL_PATH))
 model = GPT.load(MODEL_PATH, device=DEVICE)
 
 params = sum(p.numel() for p in model.parameters())
@@ -312,6 +342,28 @@ for prompt in ["The", "Once upon a time", "In the beginning"]:
     print(f"--- {prompt!r} ---")
     print(generate(model, tok, prompt, max_new_tokens=300, temperature=0.7))
     print()
+''')
+
+md(r"""
+### Thinking traces (optional)
+
+Models trained on thinking datasets (e.g. SupraThink) wrap reasoning in
+tags. `split_thinking` separates the reasoning span from the final answer.
+""")
+
+code(r'''
+# Set these to your dataset's tags (SupraThink shown), or leave None.
+THINK_START = "<|begin_of_thought|>"
+THINK_END = "<|end_of_thought|>"
+
+prompt = "User: Explain photosynthesis in one sentence.\nAssistant:"
+out = generate(model, tok, prompt, max_new_tokens=300, temperature=0.7)
+thinking, answer = split_thinking(out, THINK_START, THINK_END)
+if thinking is not None:
+    print("--- thinking ---")
+    print(thinking)
+    print("--- answer ---")
+print(answer)
 ''')
 
 md(r"""
@@ -361,7 +413,104 @@ except (EOFError, KeyboardInterrupt):
 ''')
 
 md(r"""
-## 8. Save
+## 8. Merge two runs (optional)
+
+Average two checkpoints into one. Both must share `--arch` and tokenizer —
+e.g. a base run plus its continuation, or two seeds of the same corpus.
+Skip this section if you only trained once.
+""")
+
+code(r'''
+# ── Edit these ───────────────────────────────────────────────────────
+MERGE_A = MODEL_PATH          # first checkpoint
+MERGE_B = None                # e.g. f"{DATA_DIR}/shimba_run2.pth"
+MERGED_PATH = f"{DATA_DIR}/{RUN_NAME}_merged.pth"
+
+if MERGE_B and os.path.exists(MERGE_A) and os.path.exists(MERGE_B):
+    import subprocess
+    subprocess.run([
+        "python", "-u", "merge.py",
+        "--models", MERGE_A, MERGE_B,
+        "--out", MERGED_PATH,
+    ], check=True)
+    print("merged ->", MERGED_PATH)
+else:
+    print("Set MERGE_B to a second checkpoint to merge, else skip.")
+''')
+
+md(r"""
+## 9. Export to GGUF (optional)
+
+Writes a `.gguf` next to the model for Ollama. `--compat gpt2` loads
+`shimba`-arch models in Ollama; `llama`-arch models export natively
+(`--compat` defaults to following the checkpoint, so usually omit it).
+""")
+
+code(r'''
+# ── Edit these ───────────────────────────────────────────────────────
+EXPORT_GGUF = False
+GGUF_MODEL = MERGED_PATH if os.path.exists(f"{DATA_DIR}/{RUN_NAME}_merged.pth") else MODEL_PATH
+GGUF_PATH = os.path.splitext(GGUF_MODEL)[0] + ".gguf"
+GGUF_OUTTYPE = "q8_0"    # f32 | f16 | q8_0
+GGUF_COMPAT = "auto"     # auto | none | gpt2 | llama
+
+if EXPORT_GGUF:
+    from pth2gguf import convert
+    convert(GGUF_MODEL, GGUF_PATH, outtype=GGUF_OUTTYPE, compat=GGUF_COMPAT)
+    print(f"gguf -> {GGUF_PATH} ({os.path.getsize(GGUF_PATH)/1024**2:.2f} MB)")
+    print("Download it, then:  ollama create mymodel -f Modelfile")
+    print('Modelfile content:  FROM ./<name>.gguf  +  PARAMETER num_ctx <block_size>')
+else:
+    print("Set EXPORT_GGUF = True to export, else skip.")
+''')
+
+md(r"""
+## 10. Yarn-art image demo (optional)
+
+The [Norod78/Yarn-art-style](https://huggingface.co/datasets/Norod78/Yarn-art-style)
+dataset pairs yarn-art images with captions. This repo trains on **text**,
+so the demo below shows the images with their captions (the Loader-ready
+text side), and saves the captions as JSONL you can train on.
+Image pixels themselves are not trainable here — no vision encoder exists.
+""")
+
+code(r'''
+# ── Yarn-art gallery + captions JSONL ──────────────────────────────
+SHOW_YARN = False
+YARN_N = 6   # images to display
+
+if SHOW_YARN:
+    try:
+        from datasets import load_dataset
+    except ImportError:
+        import subprocess as _sp
+        _sp.run(["pip", "install", "-q", "datasets"], check=True)
+        from datasets import load_dataset
+
+    ds = load_dataset("Norod78/Yarn-art-style", split="train")
+    print(f"rows: {len(ds)}")
+
+    from IPython.display import display
+    caps = []
+    for i, row in enumerate(ds):
+        if i >= YARN_N:
+            break
+        print(f"[{i}] {row['text']}")
+        display(row["image"])   # PIL image renders inline in Colab
+        caps.append({"text": row["text"]})
+
+    import json as _json
+    caps_path = f"{DATA_DIR}/yarn_captions.jsonl"
+    with open(caps_path, "w", encoding="utf-8") as _f:
+        for c in caps:
+            _f.write(_json.dumps(c) + "\n")
+    print(f"captions -> {caps_path} (train on it with --data pointing there)")
+else:
+    print("Set SHOW_YARN = True to load and display the dataset, else skip.")
+''')
+
+md(r"""
+## 11. Save
 
 Two `.pth` files and one tokenizer — **all three are needed**. The tokenizer
 is derived from your corpus, so a model without it can't be loaded.

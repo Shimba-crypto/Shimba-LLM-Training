@@ -11,6 +11,7 @@ Usage:
     python quick_train.py --data corpus.txt --out model.pth
     python quick_train.py --data corpus.txt --out model.pth --resume
     python quick_train.py --data ./texts --out runs/shimba.pth --device cuda --amp
+    python quick_train.py --data data.jsonl --out runs/shimba.pth
 """
 
 import argparse
@@ -33,42 +34,38 @@ from llm.train import Trainer, TrainConfig, get_lr, resume_from
 enable_safe_output()
 
 
-def load_corpus(path: str, pattern: str = "*.txt") -> str:
-    """Read a single .txt file, or merge every .txt under a directory."""
-    if os.path.isfile(path):
-        with open(path, "r", encoding="utf-8") as f:
-            return f.read()
+def load_corpus(path: str, pattern: str = "*.txt,*.json,*.jsonl",
+                text_field=None, data_format: str = "auto") -> str:
+    """Read a single file, or merge every matching file under a directory."""
+    from llm.corpus import load_corpus_text
 
-    if os.path.isdir(path):
-        import fnmatch
-
-        parts = []
-        for root, dirs, files in os.walk(path):
-            dirs.sort()
-            for name in sorted(files):
-                if fnmatch.fnmatch(name.lower(), pattern.lower()):
-                    with open(os.path.join(root, name), "r", encoding="utf-8",
-                              errors="replace") as f:
-                        text = f.read()
-                    if text.strip():
-                        parts.append(text)
-        if not parts:
-            print(f"[quick_train] no files matching '{pattern}' under '{path}'")
-            sys.exit(1)
-        print(f"[quick_train] merged {len(parts)} file(s) from '{path}'")
-        return "\n\n" + ("\n\n" + "=" * 60 + "\n\n").join(parts)
-
-    print(f"[quick_train] --data path not found: '{path}'")
-    sys.exit(1)
+    return load_corpus_text(
+        path,
+        pattern=pattern,
+        recurse=True,
+        text_field=text_field,
+        data_format=data_format,
+    )
 
 
 def main():
     p = argparse.ArgumentParser(description="Shimba LLM — checkpoint-every-step trainer")
-    p.add_argument("--data", required=True, help="Path to a .txt file OR a folder of .txt files")
+    p.add_argument("--data", required=True, help="Path to a .txt/.json/.jsonl file OR a folder of them")
     p.add_argument("--out", default="model.pth")
     p.add_argument("--resume", action="store_true", help="Continue from --out if it exists")
-    p.add_argument("--pattern", default="*.txt")
+    p.add_argument("--pattern", default="*.txt,*.json,*.jsonl",
+                   help="Comma-separated glob(s) when --data is a folder")
+    p.add_argument("--text_field", default=None,
+                   help="JSON field(s) to train on, comma-separated (default: auto-detect)")
+    p.add_argument("--format", default="auto", choices=["auto", "txt", "json", "jsonl"],
+                   help="Corpus parser (default: auto-detect from extension)")
+    p.add_argument("--tokenizer", default="char", choices=["char", "bpe"],
+                   help="Tokenizer: char (default) or byte-level BPE")
+    p.add_argument("--vocab-size", type=int, default=2000,
+                   help="BPE vocabulary size target (default: 2000)")
     # Model
+    p.add_argument("--arch", default="shimba", choices=["shimba", "gpt2", "llama"],
+                   help="Block architecture (default: shimba)")
     p.add_argument("--n_embd", type=int, default=64)
     p.add_argument("--n_layer", type=int, default=2)
     p.add_argument("--n_head", type=int, default=2)
@@ -99,11 +96,23 @@ def main():
     resuming = args.resume and os.path.exists(args.out) and os.path.exists(tok_path)
 
     print(f"[quick_train] loading corpus from {args.data} ...")
-    text = load_corpus(args.data, args.pattern)
+    text = load_corpus(args.data, args.pattern, args.text_field, args.format)
 
     if resuming:
+        from llm.bpe import load_tokenizer
         print("[quick_train] resume: loading existing tokenizer ...")
-        tokenizer = CharTokenizer.load(tok_path)
+        tokenizer = load_tokenizer(tok_path)
+        saved_kind = getattr(tokenizer, "TYPE", "char")
+        if saved_kind != args.tokenizer:
+            print(f"[quick_train] saved tokenizer is '{saved_kind}' but "
+                  f"--tokenizer is '{args.tokenizer}'. "
+                  f"Resume with the matching kind.")
+            sys.exit(1)
+    elif args.tokenizer == "bpe":
+        from llm.bpe import BPETokenizer
+        print("[quick_train] training BPE tokenizer ...")
+        tokenizer = BPETokenizer().build(text, vocab_size=args.vocab_size)
+        tokenizer.save(tok_path)
     else:
         print("[quick_train] building tokenizer ...")
         tokenizer = CharTokenizer().build(text)
@@ -128,11 +137,17 @@ def main():
 
         model_cfg = load_checkpoint(args.out)[0]
         print(f"[quick_train] resume: saved architecture "
-              f"(vocab={model_cfg.vocab_size}, n_layer={model_cfg.n_layer}, "
+              f"(arch={getattr(model_cfg, 'arch', 'shimba')}, "
+              f"vocab={model_cfg.vocab_size}, n_layer={model_cfg.n_layer}, "
               f"n_embd={model_cfg.n_embd}, block_size={model_cfg.block_size})")
         if model_cfg.vocab_size != tokenizer.vocab_size:
             print(f"[quick_train] vocab mismatch: model wants "
                   f"{model_cfg.vocab_size}, tokenizer has {tokenizer.vocab_size}")
+            sys.exit(1)
+        if getattr(model_cfg, "arch", "shimba") != args.arch:
+            print(f"[quick_train] arch mismatch: checkpoint is "
+                  f"'{getattr(model_cfg, 'arch', 'shimba')}' but --arch is "
+                  f"'{args.arch}'. Resume with the matching --arch.")
             sys.exit(1)
     else:
         model_cfg = GPTConfig(
@@ -142,7 +157,8 @@ def main():
             n_head=args.n_head,
             n_layer=args.n_layer,
             dropout=args.dropout,
-            bias=False,
+            bias=args.arch == "gpt2",
+            arch=args.arch,
         )
 
     train_cfg = TrainConfig(

@@ -1,18 +1,20 @@
 """
-model.py — Shimba decoder-only Transformer (CPU-optimised)
+model.py — Decoder-only Transformer (CPU-optimised), three architectures.
 
-Architecture:
-  Embedding → N × TransformerBlock → LayerNorm → LM Head
+`arch` selects the block design; everything else (training loop, checkpoint
+format, char tokenizer) is shared:
 
-Each TransformerBlock:
-  LayerNorm → CausalSelfAttention → residual
-  LayerNorm → MLP                 → residual
+shimba (default) — LayerNorm, learned absolute positions, fused-QKV MHA,
+    GELU MLP, no biases.
+gpt2             — same block as shimba but with biases on every Linear
+    and LayerNorm, matching HF GPT-2.
+llama            — RMSNorm, RoPE positions (no position embedding), SwiGLU
+    MLP, optional GQA via n_head_kv, no biases.
 
 Memory strategy:
   - float32 throughout (no mixed precision needed for CPU)
-  - bias=False by default (fewer parameters, slightly faster)
-  - Flash-attention-style manual scaled dot-product (torch.nn.functional)
   - Weight tying between token embedding and LM head
+  - Flash-attention-style manual scaled dot-product (torch.nn.functional)
 """
 
 import math
@@ -38,6 +40,34 @@ class GPTConfig:
     n_layer:    int   = 4       # number of transformer blocks
     dropout:    float = 0.1     # dropout probability
     bias:       bool  = False   # use bias in Linear / LayerNorm?
+    arch:       str   = "shimba"  # shimba | gpt2 | llama
+    n_head_kv:  int | None = None  # GQA key/value heads (llama); None → n_head
+    rope_base:  float = 10000.0    # RoPE frequency base (llama)
+
+
+ARCHES = ("shimba", "gpt2", "llama")
+
+
+def cfg_arch(cfg: GPTConfig) -> str:
+    """Architecture with a fallback for checkpoints saved before it existed."""
+    return getattr(cfg, "arch", "shimba") or "shimba"
+
+
+def cfg_n_kv(cfg: GPTConfig) -> int:
+    """Key/value head count (GQA); plain MHA when equal to n_head."""
+    return getattr(cfg, "n_head_kv", None) or cfg.n_head
+
+
+def uses_rope(cfg: GPTConfig) -> bool:
+    return cfg_arch(cfg) == "llama"
+
+
+def uses_rmsnorm(cfg: GPTConfig) -> bool:
+    return cfg_arch(cfg) == "llama"
+
+
+def uses_swiglu(cfg: GPTConfig) -> bool:
+    return cfg_arch(cfg) == "llama"
 
 
 # ---------------------------------------------------------------------------
@@ -56,26 +86,72 @@ class LayerNorm(nn.Module):
         return F.layer_norm(x, self.weight.shape, self.weight, self.bias, eps=1e-5)
 
 
+class RMSNorm(nn.Module):
+    """Root-mean-square norm, no bias, no mean-centering (llama arch)."""
+
+    def __init__(self, ndim: int):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(ndim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        var = x.float().pow(2).mean(dim=-1, keepdim=True)
+        x = x * torch.rsqrt(var + 1e-5)
+        return (self.weight * x.to(self.weight.dtype)).to(x.dtype)
+
+
+def make_norm(ndim: int, cfg: GPTConfig) -> nn.Module:
+    return RMSNorm(ndim) if uses_rmsnorm(cfg) else LayerNorm(ndim, cfg.bias)
+
+
+def _rope_cos_sin(seq_len: int, head_dim: int, base: float,
+                  device: torch.device) -> tuple:
+    """RoPE rotation angles for positions 0..seq_len-1 (NeoX half-split)."""
+    inv = 1.0 / (base ** (torch.arange(0, head_dim, 2, device=device).float()
+                          / head_dim))
+    t = torch.arange(seq_len, device=device).float()
+    freqs = torch.outer(t, inv)                       # (T, hd/2)
+    return freqs.cos(), freqs.sin()
+
+
+def _apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """Rotate q/k of shape (..., T, head_dim) in place-free fashion."""
+    d = x.shape[-1] // 2
+    x1, x2 = x[..., :d], x[..., d:]
+    return torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
+
+
 class CausalSelfAttention(nn.Module):
     """
     Multi-head causal (decoder) self-attention.
 
     Uses PyTorch's scaled_dot_product_attention when available (≥2.0)
-    which is both memory-efficient and fast even on CPU.
+    which is both memory-efficient and fast even on CPU. With n_head_kv <
+    n_head the key/value heads are repeated (GQA); with the llama arch the
+    queries and keys get RoPE rotations.
     """
 
     def __init__(self, cfg: GPTConfig):
         super().__init__()
         assert cfg.n_embd % cfg.n_head == 0, \
             f"n_embd ({cfg.n_embd}) must be divisible by n_head ({cfg.n_head})"
+        n_kv = cfg_n_kv(cfg)
+        assert cfg.n_head % n_kv == 0, \
+            f"n_head ({cfg.n_head}) must be divisible by n_head_kv ({n_kv})"
+        if uses_rope(cfg):
+            assert (cfg.n_embd // cfg.n_head) % 2 == 0, \
+                "RoPE needs an even head_dim"
 
         self.n_head   = cfg.n_head
+        self.n_kv     = n_kv
         self.n_embd   = cfg.n_embd
         self.head_dim = cfg.n_embd // cfg.n_head
         self.dropout  = cfg.dropout
+        self.rope     = uses_rope(cfg)
+        self.rope_base = getattr(cfg, "rope_base", 10000.0) or 10000.0
 
         # Single fused projection for Q, K, V
-        self.c_attn = nn.Linear(cfg.n_embd, 3 * cfg.n_embd, bias=cfg.bias)
+        self.c_attn = nn.Linear(cfg.n_embd, (cfg.n_head + 2 * n_kv) * self.head_dim,
+                                bias=cfg.bias)
         # Output projection
         self.c_proj = nn.Linear(cfg.n_embd, cfg.n_embd, bias=cfg.bias)
 
@@ -93,14 +169,25 @@ class CausalSelfAttention(nn.Module):
         B, T, C = x.shape   # batch, time (seq len), channels
 
         # Compute Q, K, V in one matmul then split
-        qkv = self.c_attn(x)                          # (B, T, 3C)
-        q, k, v = qkv.split(self.n_embd, dim=2)
+        qkv = self.c_attn(x)
+        q, k, v = qkv.split((self.n_head * self.head_dim,
+                             self.n_kv * self.head_dim,
+                             self.n_kv * self.head_dim), dim=2)
 
         # Reshape to (B, n_head, T, head_dim)
-        def _reshape(t: torch.Tensor) -> torch.Tensor:
-            return t.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        k = k.view(B, T, self.n_kv, self.head_dim).transpose(1, 2)
+        v = v.view(B, T, self.n_kv, self.head_dim).transpose(1, 2)
 
-        q, k, v = _reshape(q), _reshape(k), _reshape(v)
+        if self.rope:
+            cos, sin = _rope_cos_sin(T, self.head_dim, self.rope_base, x.device)
+            q, k = _apply_rope(q, cos, sin), _apply_rope(k, cos, sin)
+
+        if self.n_kv != self.n_head:
+            # Grouped-query attention: repeat each kv head across its group.
+            rep = self.n_head // self.n_kv
+            k = k.repeat_interleave(rep, dim=1)
+            v = v.repeat_interleave(rep, dim=1)
 
         # Try efficient SDPA (PyTorch ≥ 2.0); fall back to manual
         try:
@@ -130,18 +217,28 @@ class CausalSelfAttention(nn.Module):
 class MLP(nn.Module):
     """
     Position-wise feed-forward network.
-    Expands to 4× hidden dim with GELU activation.
+
+    GELU variant: expands to 4× hidden dim with GELU activation.
+    SwiGLU variant (llama arch): SiLU-gated pair with the same 4× width.
     """
 
     def __init__(self, cfg: GPTConfig):
         super().__init__()
         hidden = 4 * cfg.n_embd
-        self.fc   = nn.Linear(cfg.n_embd, hidden, bias=cfg.bias)
-        self.proj = nn.Linear(hidden, cfg.n_embd, bias=cfg.bias)
+        self.swiglu = uses_swiglu(cfg)
+        if self.swiglu:
+            self.gate = nn.Linear(cfg.n_embd, hidden, bias=cfg.bias)
+            self.up   = nn.Linear(cfg.n_embd, hidden, bias=cfg.bias)
+            self.proj = nn.Linear(hidden, cfg.n_embd, bias=cfg.bias)
+        else:
+            self.fc   = nn.Linear(cfg.n_embd, hidden, bias=cfg.bias)
+            self.proj = nn.Linear(hidden, cfg.n_embd, bias=cfg.bias)
         self.drop = nn.Dropout(cfg.dropout)
         self.act  = nn.GELU()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.swiglu:
+            return self.drop(self.proj(F.silu(self.gate(x)) * self.up(x)))
         return self.drop(self.proj(self.act(self.fc(x))))
 
 
@@ -150,9 +247,9 @@ class TransformerBlock(nn.Module):
 
     def __init__(self, cfg: GPTConfig):
         super().__init__()
-        self.ln1  = LayerNorm(cfg.n_embd, cfg.bias)
+        self.ln1  = make_norm(cfg.n_embd, cfg)
         self.attn = CausalSelfAttention(cfg)
-        self.ln2  = LayerNorm(cfg.n_embd, cfg.bias)
+        self.ln2  = make_norm(cfg.n_embd, cfg)
         self.mlp  = MLP(cfg)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -172,21 +269,24 @@ class GPT(nn.Module):
     Key design choices for CPU efficiency:
       * Weight tying: lm_head shares weights with token embedding
         (saves ~vocab_size × n_embd × 4 bytes of RAM).
-      * No positional encoding bias parameter (learned absolute positions).
       * All operations in float32 — no device transfers needed.
     """
 
     def __init__(self, cfg: GPTConfig):
         super().__init__()
         self.cfg = cfg
+        self.rope = uses_rope(cfg)
 
-        self.transformer = nn.ModuleDict(dict(
+        modules = dict(
             wte  = nn.Embedding(cfg.vocab_size, cfg.n_embd),   # token embeddings
-            wpe  = nn.Embedding(cfg.block_size, cfg.n_embd),   # position embeddings
             drop = nn.Dropout(cfg.dropout),
             h    = nn.ModuleList([TransformerBlock(cfg) for _ in range(cfg.n_layer)]),
-            ln_f = LayerNorm(cfg.n_embd, cfg.bias),
-        ))
+            ln_f = make_norm(cfg.n_embd, cfg),
+        )
+        if not self.rope:
+            # Learned absolute positions (shimba/gpt2); RoPE needs none.
+            modules["wpe"] = nn.Embedding(cfg.block_size, cfg.n_embd)
+        self.transformer = nn.ModuleDict(modules)
 
         # LM head — no bias, weights tied to token embedding below
         self.lm_head = nn.Linear(cfg.n_embd, cfg.vocab_size, bias=False)
@@ -222,11 +322,14 @@ class GPT(nn.Module):
         assert T <= self.cfg.block_size, \
             f"Sequence length {T} exceeds block_size {self.cfg.block_size}"
 
-        # Token + position embeddings
-        pos = torch.arange(T, device=idx.device)          # (T,)
+        # Token embeddings, plus learned positions unless RoPE handles it.
         tok_emb = self.transformer.wte(idx)                # (B, T, n_embd)
-        pos_emb = self.transformer.wpe(pos)                # (T, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb)
+        if self.rope:
+            x = self.transformer.drop(tok_emb)
+        else:
+            pos = torch.arange(T, device=idx.device)       # (T,)
+            pos_emb = self.transformer.wpe(pos)            # (T, n_embd)
+            x = self.transformer.drop(tok_emb + pos_emb)
 
         # Transformer blocks
         for block in self.transformer.h:
@@ -261,7 +364,7 @@ class GPT(nn.Module):
         """
         decay, no_decay = set(), set()
         whitelist = (nn.Linear,)
-        blacklist = (LayerNorm, nn.Embedding)
+        blacklist = (LayerNorm, RMSNorm, nn.Embedding)
 
         for mn, m in self.named_modules():
             for pn, _ in m.named_parameters():
@@ -297,18 +400,47 @@ class GPT(nn.Module):
     @classmethod
     def load(cls, path: str, device: "torch.device | str | None" = None) -> "GPT":
         """
-        Load model from a .pth file produced by save().
+        Load model from a .pth or .scw file.
 
-        Tolerates checkpoints written by older versions of this project:
+        .pth tolerates checkpoints written by older versions of this project:
         weights stored under "model" or "weights", and keys prefixed with
-        `_orig_mod.` by torch.compile.
+        `_orig_mod.` by torch.compile. .scw is the single-file format
+        (weights + config + tokenizer); its tensors stay memory-mapped.
         """
         from .device import resolve_device
 
-        cfg, checkpoint = load_checkpoint(path, map_location="cpu")
-        model = cls(cfg)
-        model.load_state_dict(checkpoint["state_dict"])
-        model.eval()
+        if path.endswith(".scw"):
+            from .scw import load_scw
+
+            cfg, state, keepalive = load_scw(path)
+            model = cls(cfg)
+            # Buffers like causal_mask are rebuilt by __init__ and not
+            # stored in the file, so anything else missing is an error.
+            incompatible = model.load_state_dict(state, strict=False)
+            missing = [k for k in incompatible.missing_keys
+                       if "causal_mask" not in k]
+            if missing or incompatible.unexpected_keys:
+                raise RuntimeError(
+                    f"Error(s) in loading {path}: missing={missing} "
+                    f"unexpected={incompatible.unexpected_keys}")
+            model.eval()
+            # f32 tensors arrived as mmap views; point the parameters at
+            # them so the model shares RAM with the file (f16/q8_0 already
+            # came back as converted copies and stay as loaded).
+            own = dict(model.named_parameters())
+            for k, v in state.items():
+                p = own.get(k)
+                if (p is not None and v.dtype == torch.float32
+                        and v.device.type == "cpu" and v.is_contiguous()
+                        and v.shape == p.shape and v.numel() == p.numel()):
+                    p.data = v
+            # Keeps the mmap alive as long as the model does.
+            model._scw_keepalive = keepalive
+        else:
+            cfg, checkpoint = load_checkpoint(path, map_location="cpu")
+            model = cls(cfg)
+            model.load_state_dict(checkpoint["state_dict"])
+            model.eval()
 
         if device is not None:
             model.to(resolve_device(device))

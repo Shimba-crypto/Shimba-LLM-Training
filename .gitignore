@@ -58,3 +58,6 @@ htmlcov/
 .DS_Store
 Thumbs.db
 desktop.ini
+# Notebook builders/outputs kept local (generated, bulky diffs)
+build_suprathinker_notebook.py
+*.ipynb

@@ -33,6 +33,7 @@ class CharTokenizer:
 
     PAD_TOKEN = "<PAD>"
     UNK_TOKEN = "<UNK>"
+    TYPE = "char"
 
     def __init__(self):
         # Will be populated by build() or load()
@@ -85,6 +86,7 @@ class CharTokenizer:
     def save(self, path: str) -> None:
         """Serialise tokenizer vocab to a JSON file."""
         data = {
+            "type": self.TYPE,
             "char2idx": self.char2idx,
             "vocab_size": self.vocab_size,
         }
@@ -95,13 +97,15 @@ class CharTokenizer:
     @classmethod
     def load(cls, path: str) -> "CharTokenizer":
         """Load a previously saved tokenizer from JSON."""
-        tok = cls()
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
+        return cls.from_dict(data, path)
+
+    @classmethod
+    def from_dict(cls, data: dict, path: str = "<dict>") -> "CharTokenizer":
+        """Build from already-parsed JSON content (files and .scw alike)."""
+        tok = cls()
         tok.char2idx   = data["char2idx"]
-        tok.idx2char   = {int(k): v for k, v in
-                          {str(v): k for k, v in data["char2idx"].items()}.items()}
-        # Rebuild idx2char properly
         tok.idx2char   = {v: k for k, v in tok.char2idx.items()}
         tok.vocab_size = data["vocab_size"]
         print(f"[tokenizer] loaded ← {path}  (vocab_size={tok.vocab_size})")

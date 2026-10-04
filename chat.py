@@ -16,7 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from llm.model import GPT
 from llm.tokenizer import CharTokenizer
-from llm.generate import generate
+from llm.generate import generate, iter_generate
 from llm.compat import enable_safe_output
 
 enable_safe_output()
@@ -85,6 +85,29 @@ class ChatSession:
         self.history.append(("assistant", response))
         return response
 
+    def get_response_stream(self, user_input: str):
+        """Yield response chunks as they are generated."""
+        self.history.append(("user", user_input.strip()))
+        prompt = self._build_prompt()
+        prompt = self._trim_history(prompt)
+
+        temp = self.temperature
+        if self.temperature_ramp:
+            temp = min(1.5, self.temperature + self.temperature_ramp * (len(self.history) // 2))
+
+        parts = []
+        for chunk in iter_generate(
+            self.model, self.tokenizer, prompt,
+            max_new_tokens=self.max_new_tokens,
+            temperature=temp,
+            top_k=self.top_k,
+            top_p=self.top_p,
+        ):
+            parts.append(chunk)
+            yield chunk
+        response = "".join(parts).lstrip()
+        self.history.append(("assistant", response))
+
     def reset(self):
         self.history = []
 
@@ -98,8 +121,12 @@ def main():
     parser.add_argument("--max_history", type=int, default=1024, help="Max tokens to keep in conversation history")
     parser.add_argument("--device", default="auto", help="auto | cpu | cuda | cuda:N | mps")
     parser.add_argument("--temperature_ramp", type=float, default=0.0,
-                        help="Per-turn temperature increase; 0 disables (recommended for "
-                             "a char-level model, which drifts fast at high temperature)")
+                         help="Per-turn temperature increase; 0 disables (recommended for "
+                              "a char-level model, which drifts fast at high temperature)")
+    parser.add_argument("--stream", dest="stream", action=argparse.BooleanOptionalAction,
+                        default=True,
+                        help="Print tokens as they are generated (default: on). "
+                             "Use --no-stream to print the full reply at once.")
     args = parser.parse_args()
 
     # Check the model exists before the tokenizer, so a bad path names the
@@ -108,12 +135,20 @@ def main():
         print(f"[error] Model file not found: {args.model}")
         sys.exit(1)
 
-    tok_path = CharTokenizer.default_path(args.model)
-    if not os.path.exists(tok_path):
+    from llm.scw import load_tokenizer_for
+    from llm.tokenizer import CharTokenizer
+    if args.model.endswith(".scw") or os.path.exists(
+            CharTokenizer.default_path(args.model)):
+        try:
+            tokenizer = load_tokenizer_for(args.model)
+        except (FileNotFoundError, ValueError) as e:
+            print(f"[error] {e}")
+            sys.exit(1)
+    else:
+        tok_path = CharTokenizer.default_path(args.model)
         print(f"[error] Tokenizer not found at {tok_path}")
         print("        The tokenizer JSON must sit beside the model file.")
         sys.exit(1)
-    tokenizer = CharTokenizer.load(tok_path)
 
     print(f"[chat] Loading model from {args.model} ...")
     # GPT.load handles every historical checkpoint layout, including weights
@@ -150,8 +185,19 @@ def main():
                 print("[Conversation reset]")
                 continue
 
-            response = chat.get_response(user_input)
-            print(f"\n{response}\n")
+            if args.stream:
+                try:
+                    for chunk in chat.get_response_stream(user_input):
+                        sys.stdout.write(chunk)
+                        sys.stdout.flush()
+                    sys.stdout.write("\n\n")
+                    sys.stdout.flush()
+                except Exception as e:
+                    print(f"[error] {e}")
+                    continue
+            else:
+                response = chat.get_response(user_input)
+                print(f"\n{response}\n")
         except KeyboardInterrupt:
             print("\nGoodbye!")
             break
