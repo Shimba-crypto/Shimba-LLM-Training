@@ -245,7 +245,10 @@ def main():
             if trainer.iter_num % train_cfg.log_interval == 0 and trainer.iter_num > 0:
                 # Average, not sum — accumulating raw per-step losses makes the
                 # number scale with log_interval and reads as nonsense.
-                avg = accum_loss / max(1, accum_count)
+                # Multiply back: each term above was divided by grad_accum
+                # for the backward pass, so the raw mean reads that much low.
+                avg = (accum_loss / max(1, accum_count)
+                       * train_cfg.gradient_accumulation_steps)
                 print(f"  iter {trainer.iter_num:6d}  loss={avg:.4f}  lr={lr:.2e}")
                 accum_loss = 0.0
                 accum_count = 0

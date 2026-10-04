@@ -347,9 +347,13 @@ class Trainer:
             if self.iter_num % tcfg.log_interval == 0 and self.iter_num > 0:
                 # Average across the window, not a running sum — a sum scales
                 # with log_interval and is not comparable between runs.
+                # Multiply back: each term above was divided by grad_accum
+                # for the backward pass, so the raw mean reads that much low.
+                avg = (accum_loss / max(1, accum_count)
+                       * tcfg.gradient_accumulation_steps)
                 print(
                     f"  iter {self.iter_num:5d}  "
-                    f"loss={accum_loss / max(1, accum_count):.4f}  lr={lr:.2e}"
+                    f"loss={avg:.4f}  lr={lr:.2e}"
                 )
             accum_loss = 0.0
             accum_count = 0
