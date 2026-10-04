@@ -83,7 +83,13 @@ def save_checkpoint(path: str, model: torch.nn.Module, **extra: Any) -> None:
     Writes `config` + `state_dict`. Any compiled wrapper is peeled off first,
     and the module is temporarily moved to CPU so a GPU-trained model saves
     portable files.
+
+    The write is atomic: torch saves to `path + ".tmp"` and the file is
+    moved into place only when complete, so killing the run mid-save can
+    never leave a truncated checkpoint behind.
     """
+    import os
+
     model = unwrap(model)
 
     was_training = model.training
@@ -97,7 +103,9 @@ def save_checkpoint(path: str, model: torch.nn.Module, **extra: Any) -> None:
             "state_dict": model.state_dict(),
         }
         payload.update(extra)
-        torch.save(payload, path)
+        tmp_path = path + ".tmp"
+        torch.save(payload, tmp_path)
+        os.replace(tmp_path, path)
     finally:
         model.to(was_device)
         model.train(was_training)

@@ -135,7 +135,14 @@ def main():
     if resuming:
         from llm.checkpoint import load_checkpoint
 
-        model_cfg = load_checkpoint(args.out)[0]
+        try:
+            model_cfg = load_checkpoint(args.out)[0]
+        except Exception as e:
+            print(f"[error] checkpoint at '{args.out}' is unreadable ({e}).")
+            print("        It was likely truncated by a kill during saving "
+                  "(versions before atomic saves). Delete the .pth to start "
+                  "over — the tokenizer file is reused, not rebuilt.")
+            sys.exit(1)
         print(f"[quick_train] resume: saved architecture "
               f"(arch={getattr(model_cfg, 'arch', 'shimba')}, "
               f"vocab={model_cfg.vocab_size}, n_layer={model_cfg.n_layer}, "

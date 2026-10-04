@@ -214,7 +214,13 @@ def cmd_train(args: argparse.Namespace) -> None:
     #    A vocab_size mismatch against the saved tokenizer would throw deep
     #    inside the embedding lookup, so surface it here instead.
     if resuming:
-        model_cfg = load_checkpoint(args.out)[0]
+        try:
+            model_cfg = load_checkpoint(args.out)[0]
+        except Exception as e:
+            print(f"[error] checkpoint at '{args.out}' is unreadable ({e}).")
+            print("        Delete the .pth to start over (the tokenizer file "
+                  "is reused, not rebuilt).")
+            sys.exit(1)
         print(f"[train] resume: using saved architecture "
               f"(arch={getattr(model_cfg, 'arch', 'shimba')}, "
               f"vocab={model_cfg.vocab_size}, n_layer={model_cfg.n_layer}, "
