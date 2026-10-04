@@ -306,8 +306,26 @@ if CFG["amp"]:
 if os.path.exists(MODEL_PATH):
     cmd.append("--resume")
 
-print(" ".join(cmd), "\n")
-subprocess.run(cmd, check=True)
+print(" ".join(cmd))
+print(f"live log -> {DATA_DIR}/{RUN_NAME}.log  "
+      f"(tail it from another cell if this looks stuck)\n")
+
+# Tee: stream to the cell AND to a log file on Drive, so a silent cell
+# never hides progress. `tail -30` the log from any other cell.
+log_path = f"{DATA_DIR}/{RUN_NAME}.log"
+proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT, text=True, bufsize=1)
+with open(log_path, "w", encoding="utf-8") as log_f:
+    log_f.write(" ".join(cmd) + "\n\n")
+    log_f.flush()
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        print(line, end="", flush=True)
+        log_f.write(line)
+rc = proc.wait()
+if rc != 0:
+    raise subprocess.CalledProcessError(rc, cmd)
+print(f"\ndone — full log: {log_path}")
 ''')
 
 md(r"""
