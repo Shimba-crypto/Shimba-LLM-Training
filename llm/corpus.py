@@ -242,6 +242,16 @@ def extract_doc_text(obj: dict, text_field=None):
 
 def _template_doc(obj: dict):
     """Instruction / prompt / question templates. Returns None if no match."""
+    if isinstance(obj.get("user"), str) and isinstance(obj.get("assistant"), str):
+        parts = []
+        if isinstance(obj.get("system"), str) and obj["system"].strip():
+            parts.append(f"System: {obj['system'].strip()}")
+        if obj["user"].strip():
+            parts.append(f"User: {obj['user'].strip()}")
+        if obj["assistant"].strip():
+            parts.append(f"Assistant: {obj['assistant'].strip()}")
+        return "\n".join(parts) if parts else None
+
     if isinstance(obj.get("instruction"), str) and obj["instruction"].strip():
         parts = [f"Instruction: {obj['instruction'].strip()}"]
         for key in ("input", "context"):
