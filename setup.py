@@ -21,7 +21,7 @@ Train options
 -------------
   --data          Path to a .txt/.json/.jsonl file OR a folder of them (required)
   --out           Output model path (default: model.pth)
-  --arch          shimba | gpt2 | llama (default: shimba)
+  --arch          shimba | gpt2 | llama | flash (default: shimba)
   --block_size    Context window length          (default: 512)
   --n_embd        Embedding dimension            (default: 256)
   --n_head        Number of attention heads      (default: 4)
@@ -493,7 +493,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="BPE vocabulary size target (default: 2000)")
     # Model
     t.add_argument("--arch",          default="shimba",
-                   choices=["shimba", "gpt2", "llama"],
+                   choices=["shimba", "gpt2", "llama", "flash"],
                    help="Block architecture (default: shimba)")
     t.add_argument("--block_size",    type=int,   default=512)
     t.add_argument("--n_embd",        type=int,   default=256)

@@ -77,6 +77,7 @@ The block design is selectable at train time; merging requires equal `--arch`:
 | `shimba` (default) | LayerNorm | learned | MHA, fused QKV | GELU 4× | no | the original design |
 | `gpt2` | LayerNorm | learned | MHA, fused QKV | GELU 4× | yes | matches HF GPT-2 block-for-block |
 | `llama` | RMSNorm | RoPE | MHA/GQA, fused QKV | SwiGLU 4× | no | `n_head_kv` enables grouped-query attention |
+| `flash` | RMSNorm | RoPE | GQA by default, fused QKV | SwiGLU 4× | no | the fast arch: 1 kv head per 4 query heads + KV-cache decode path (`flash.py`) |
 
 ```bash
 python setup.py train --data corpus.txt --out gpt2.pth --arch gpt2
@@ -351,6 +352,7 @@ An int8 checkpoint only loads back into an int8-quantized model — you cannot
 ├── quick_train.py        # checkpoint-every-step trainer (Colab-friendly)
 ├── quick_test.py         # smoke test, no corpus required
 ├── chat.py               # interactive chat
+├── flash.py              # pack / info / generate for *_flash.pth fast models
 ├── quantize.py           # int8 / fp16 export
 ├── merge.py              # average / slerp checkpoint merge
 ├── scw.py                # .scw pack / info / unpack
@@ -370,7 +372,8 @@ An int8 checkpoint only loads back into an int8-quantized model — you cannot
     ├── corpus.py         # .txt / .json / .jsonl corpus loading
     ├── train.py          # Trainer, TrainConfig, resume_from
     ├── generate.py       # generate(), iter_generate(), stream_generate()
-    ├── checkpoint.py     # canonical save/load, legacy-format tolerance
+    ├── flash.py          # flash arch helpers, KVCache, fast_generate(), pack/load
+    ├── checkpoint.py     # canonical save/load, legacy-format tolerance  
     ├── scw.py            # .scw single-file format (mmap, q8_0)
     ├── device.py         # CUDA / MPS / CPU resolution
     └── compat.py         # Windows console encoding shim

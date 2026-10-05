@@ -24,10 +24,12 @@ stop_tokens : list[int]
     Generation stops early if any of these token ids is produced.
 
 stop_strings : list[str]
-    Generation stops when the decoded text ends with one of these strings
-    (e.g. an end-of-answer tag). `generate` strips the matched suffix from
-    the returned text; the streaming variant stops without retracting
-    already-printed chunks.
+    Generation stops when the decoded continuation ends with one of these
+    strings, and the matched suffix is stripped from the returned text.
+    Defaults to the corpus document separator, because a model trained on
+    joined documents learns to emit that separator between answers and
+    would otherwise print it after every reply. Pass `stop_strings=[]` to
+    disable and see raw output.
 
 Thinking traces
 ---------------
@@ -40,8 +42,28 @@ from typing import List, Optional, Tuple
 import torch
 import torch.nn.functional as F
 
+from .corpus import DOC_SEPARATOR
 from .model import GPT
 from .tokenizer import CharTokenizer
+
+# The separator is written as "\n\n====\n\n". A model reproduces it after
+# finishing an answer, so only the leading newline-plus-equals run is needed
+# to recognise it early and stop before the whole 60 characters are emitted.
+_SEP_STOP = "=" * 8
+
+
+def _default_stop_strings() -> list:
+    """Stop at the corpus separator unless the caller opts out."""
+    return [DOC_SEPARATOR.strip(), _SEP_STOP, "\nInstruction:", "\nQuestion:"]
+
+
+def _match_stop(text: str, stops: list) -> Optional[str]:
+    """Return the longest stop string `text` ends with, or None."""
+    hit = None
+    for s in stops:
+        if s and text.endswith(s) and (hit is None or len(s) > len(hit)):
+            hit = s
+    return hit
 
 
 def split_thinking(text: str, think_start: Optional[str] = None,
@@ -114,11 +136,18 @@ def generate(
     top_p:              float         = 0.95,
     repetition_penalty: float         = 1.1,
     stop_tokens:        Optional[List[int]] = None,
+    stop_strings:       Optional[List[str]] = None,
 ) -> str:
     """
     Generate `max_new_tokens` tokens given a text `prompt`.
 
-    Returns the full string (prompt + generated continuation).
+    Returns the full string (prompt + generated continuation), with any
+    matched stop string removed.
+
+    `stop_strings=None` stops at the corpus document separator and at a new
+    `Instruction:` header, which is what keeps a model trained on joined
+    documents from printing the separator after every reply. Pass `[]` to
+    see raw output.
 
     Works on whatever device the model lives on — the token tensor is created
     on that device rather than assumed to be CPU.
@@ -135,6 +164,12 @@ def generate(
     if not ids:
         ids = [0]   # fall back to PAD if prompt is empty
     idx = torch.tensor([ids], dtype=torch.int64, device=device)  # (1, T)
+
+    stops = _default_stop_strings() if stop_strings is None else [
+        s for s in stop_strings if s]
+    # Only the tail can match a stop string, so a fixed window is enough and
+    # keeps the per-token cost flat no matter how long the reply gets.
+    tail_window = max((len(s) for s in stops), default=0) + 8
 
     stop_set = set(stop_tokens) if stop_tokens else set()
     generated_ids: List[int] = []
@@ -164,8 +199,23 @@ def generate(
         seen_ids.add(token_int)
         idx = torch.cat([idx, next_id], dim=1)  # grow sequence
 
-    full_ids = ids + generated_ids
-    return tokenizer.decode(full_ids)
+        if stops:
+            tail = tokenizer.decode((ids + generated_ids)[-tail_window:])
+            if _match_stop(tail, stops) is not None:
+                break
+
+    text = tokenizer.decode(ids + generated_ids)
+    if stops:
+        # Trim at the earliest stop string anywhere in the continuation.
+        # Working on decoded text rather than tokens keeps this correct for
+        # BPE, where one character can span several tokens.
+        cont = tokenizer.decode(generated_ids)
+        cut = min((cont.find(s) for s in stops if cont.find(s) != -1),
+                  default=-1)
+        if cut != -1:
+            cont = cont[:cut]
+            return tokenizer.decode(ids) + cont
+    return text
 
 
 def iter_generate(

@@ -58,6 +58,18 @@ htmlcov/
 .DS_Store
 Thumbs.db
 desktop.ini
+# Point-0.1B demo dataset (large, regenerable)
+point-train.json
+build_point_train.py
+
+# Downloaded corpora and the scripts that pull them (large, reproducible)
+data/point/
+fetch_point_data.py
+
 # Notebook builders/outputs kept local (generated, bulky diffs)
 build_suprathinker_notebook.py
+build_math_50M_notebook.py
+build_math_dataset.py
+flash.py
+llm/flash.py
 *.ipynb

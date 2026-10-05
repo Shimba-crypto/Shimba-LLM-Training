@@ -417,10 +417,12 @@ def convert(model_path: str, out_path: str, outtype: str = "f32",
     model_name = name or os.path.splitext(os.path.basename(model_path))[0]
     if compat == "auto":
         # Follow the checkpoint: gpt2/llama checkpoints already match the
-        # GGUF layout of that name; shimba stays custom.
+        # GGUF layout of that name; flash shares the llama block (RoPE,
+        # SwiGLU, GQA) so it exports as llama; shimba stays custom.
         arch = getattr(cfg, "arch", "shimba") or "shimba"
-        compat = arch if arch in ("gpt2", "llama") else "none"
-    if compat == "llama" and (getattr(cfg, "arch", "shimba") or "shimba") != "llama":
+        compat = {"gpt2": "gpt2", "llama": "llama", "flash": "llama"}.get(arch, "none")
+    _ckpt_arch = (getattr(cfg, "arch", "shimba") or "shimba")
+    if compat == "llama" and _ckpt_arch not in ("llama", "flash"):
         print("[warn] --compat llama with a non-llama checkpoint; "
               "the blocks differ (RoPE/SwiGLU), output will not match.")
     mapped = map_names(sd, cfg, compat)

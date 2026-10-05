@@ -27,6 +27,17 @@ from .corpus import (
 )
 from .train import Trainer, TrainConfig, resume_from
 from .generate import generate, stream_generate, iter_generate
+from .flash import (
+    fast_generate,
+    KVCache,
+    pack_flash,
+    load_flash,
+    read_flash_meta,
+    is_flash_file,
+    flash_info,
+    describe_flash,
+    cache_bytes_per_token,
+)
 from .checkpoint import save_checkpoint, load_checkpoint, unwrap
 from .device import resolve_device, describe_device
 from .compat import enable_safe_output
@@ -43,6 +54,9 @@ __all__ = [
     "DEFAULT_PATTERN", "DOC_SEPARATOR",
     "Trainer", "TrainConfig", "resume_from",
     "generate", "stream_generate", "iter_generate",
+    "fast_generate", "KVCache", "pack_flash", "load_flash",
+    "read_flash_meta", "is_flash_file", "flash_info",
+    "describe_flash", "cache_bytes_per_token",
     "save_checkpoint", "load_checkpoint", "unwrap",
     "resolve_device", "describe_device",
     "enable_safe_output",

@@ -64,7 +64,7 @@ def main():
     p.add_argument("--vocab-size", type=int, default=2000,
                    help="BPE vocabulary size target (default: 2000)")
     # Model
-    p.add_argument("--arch", default="shimba", choices=["shimba", "gpt2", "llama"],
+    p.add_argument("--arch", default="shimba", choices=["shimba", "gpt2", "llama", "flash"],
                    help="Block architecture (default: shimba)")
     p.add_argument("--n_embd", type=int, default=64)
     p.add_argument("--n_layer", type=int, default=2)
