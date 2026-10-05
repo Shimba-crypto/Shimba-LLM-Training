@@ -117,7 +117,8 @@ class RMSNorm(nn.Module):
         var = x.float().pow(2).mean(dim=-1, keepdim=True)
         x = x * torch.rsqrt(var + 1e-5)
         out = (self.weight * x.to(self.weight.dtype)).to(dt)
-        if torch.is_compiling():
+        _compiling = getattr(getattr(torch, "compiler", None), "is_compiling", None)
+        if _compiling is not None and _compiling():
             # Inductor CUDA graphs reuse static outputs across runs; without
             # this the graph sees its own prior output as overwritten input.
             return out.clone()
