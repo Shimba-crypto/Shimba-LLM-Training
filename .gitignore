@@ -58,10 +58,6 @@ htmlcov/
 .DS_Store
 Thumbs.db
 desktop.ini
-# Point-0.1B demo dataset (large, regenerable)
-point-train.json
-build_point_train.py
-
 # Downloaded corpora and the scripts that pull them (large, reproducible)
 data/point/
 fetch_point_data.py
