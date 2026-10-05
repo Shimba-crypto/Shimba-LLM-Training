@@ -206,9 +206,22 @@ def cmd_train(args: argparse.Namespace) -> None:
     # Free the raw text string — we only need tokens from here on
     del text
 
-    # 4. Split into train / val
-    train_ds, val_ds = make_splits(tokens, args.block_size, val_fraction=args.val_frac)
-    del tokens   # free encoded list; datasets hold int16 tensors
+    # 4. Split into train / val — by document under --sft (prompt-masked
+    #    labels), by token window otherwise.
+    if args.sft:
+        from llm.sft import SFTTrainer, load_sft_pairs, make_sft_splits
+        pairs = load_sft_pairs(args.data, pattern=args.pattern,
+                               recurse=not args.no_recurse,
+                               text_field=args.text_field,
+                               data_format=args.format)
+        train_ds, val_ds, sft_stats = make_sft_splits(
+            pairs, tokenizer, args.block_size, val_fraction=args.val_frac,
+            template=args.sft_template)
+        del tokens
+    else:
+        train_ds, val_ds = make_splits(tokens, args.block_size, val_fraction=args.val_frac)
+        del tokens   # free encoded list; datasets hold int16 tensors
+        sft_stats = None
 
     # 5. Model config — on resume, inherit the checkpoint's architecture.
     #    A vocab_size mismatch against the saved tokenizer would throw deep
@@ -267,7 +280,11 @@ def cmd_train(args: argparse.Namespace) -> None:
     )
 
     # 7. Train
-    trainer = Trainer(model_cfg, train_cfg, train_ds, val_ds)
+    if args.sft:
+        from llm.sft import SFTTrainer
+        trainer = SFTTrainer(model_cfg, train_cfg, train_ds, val_ds, sft_stats)
+    else:
+        trainer = Trainer(model_cfg, train_cfg, train_ds, val_ds)
 
     if resuming:
         resume_from(trainer, args.out, args.max_iters)
@@ -484,6 +501,12 @@ def build_parser() -> argparse.ArgumentParser:
     t.add_argument("--format",        default="auto",
                    choices=["auto", "txt", "json", "jsonl"],
                    help="Corpus parser (default: auto-detect from extension)")
+    t.add_argument("--sft",           action="store_true",
+                   help="Supervised fine-tuning: train response tokens only "
+                        "(prompts masked), split by document")
+    t.add_argument("--sft_template",  default="instruction",
+                   choices=["instruction", "chat"],
+                   help="Pair format for --sft (default: instruction)")
     t.add_argument("--no_recurse",    action="store_true",
                    help="Do not search subfolders (top-level only)")
     t.add_argument("--tokenizer",     default="char",

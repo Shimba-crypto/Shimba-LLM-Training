@@ -59,6 +59,12 @@ def main():
                    help="JSON field(s) to train on, comma-separated (default: auto-detect)")
     p.add_argument("--format", default="auto", choices=["auto", "txt", "json", "jsonl"],
                    help="Corpus parser (default: auto-detect from extension)")
+    p.add_argument("--sft", action="store_true",
+                   help="Supervised fine-tuning: train response tokens only "
+                   "(prompts masked), split by document (default: train all tokens)")
+    p.add_argument("--sft_template", default="instruction",
+                   choices=["instruction", "chat"],
+                   help="Pair format for --sft (default: instruction)")
     p.add_argument("--tokenizer", default="char", choices=["char", "bpe"],
                    help="Tokenizer: char (default) or byte-level BPE")
     p.add_argument("--vocab-size", type=int, default=2000,
@@ -128,8 +134,19 @@ def main():
     print(f"[quick_train] total tokens: {len(tokens):,}")
     del text
 
-    train_ds, val_ds = make_splits(tokens, args.block_size, val_fraction=args.val_frac)
-    del tokens
+    if args.sft:
+        from llm.sft import SFTTrainer, load_sft_pairs, make_sft_splits
+        pairs = load_sft_pairs(args.data, pattern=args.pattern,
+                               recurse=True, text_field=args.text_field,
+                               data_format=args.format)
+        train_ds, val_ds, sft_stats = make_sft_splits(
+            pairs, tokenizer, args.block_size, val_fraction=args.val_frac,
+            template=args.sft_template)
+        del tokens
+    else:
+        train_ds, val_ds = make_splits(tokens, args.block_size, val_fraction=args.val_frac)
+        del tokens
+        sft_stats = None
 
     # --- architecture: inherit from the checkpoint when resuming --------
     if resuming:
@@ -183,7 +200,11 @@ def main():
         compile=args.compile,
     )
 
-    trainer = Trainer(model_cfg, train_cfg, train_ds, val_ds)
+    if args.sft:
+        from llm.sft import SFTTrainer
+        trainer = SFTTrainer(model_cfg, train_cfg, train_ds, val_ds, sft_stats)
+    else:
+        trainer = Trainer(model_cfg, train_cfg, train_ds, val_ds)
 
     if resuming:
         resume_from(trainer, args.out, args.max_iters)

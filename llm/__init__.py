@@ -26,6 +26,8 @@ from .corpus import (
     DOC_SEPARATOR,
 )
 from .train import Trainer, TrainConfig, resume_from
+from .sft import (SFTTrainer, SFTDataset, load_sft_pairs, make_sft_splits,
+                  render_pair, encode_pair, render_corpus_text)
 from .generate import generate, stream_generate, iter_generate
 from .flash import (
     fast_generate,
@@ -38,9 +40,20 @@ from .flash import (
     describe_flash,
     cache_bytes_per_token,
 )
+from .lora import (
+    LoRALinear,
+    inject_lora,
+    lora_parameters,
+    adapter_state,
+    load_adapter_state,
+    merge_lora_,
+    adapter_info,
+    DEFAULT_TARGETS as LORA_DEFAULT_TARGETS,
+)
 from .checkpoint import save_checkpoint, load_checkpoint, unwrap
 from .device import resolve_device, describe_device
 from .compat import enable_safe_output
+from .vida_compute import (find_vda, vda_available, vda_eval, verify_rows)
 
 __all__ = [
     "GPT", "GPTConfig", "ARCHES",
@@ -53,10 +66,16 @@ __all__ = [
     "load_corpus_text", "load_file_docs",
     "DEFAULT_PATTERN", "DOC_SEPARATOR",
     "Trainer", "TrainConfig", "resume_from",
+    "SFTTrainer", "SFTDataset", "load_sft_pairs", "make_sft_splits",
+    "render_pair", "encode_pair", "render_corpus_text",
     "generate", "stream_generate", "iter_generate",
     "fast_generate", "KVCache", "pack_flash", "load_flash",
     "read_flash_meta", "is_flash_file", "flash_info",
     "describe_flash", "cache_bytes_per_token",
+    "LoRALinear", "inject_lora", "lora_parameters", "adapter_state",
+    "load_adapter_state", "merge_lora_", "adapter_info",
+    "LORA_DEFAULT_TARGETS",
+    "find_vda", "vda_available", "vda_eval", "verify_rows",
     "save_checkpoint", "load_checkpoint", "unwrap",
     "resolve_device", "describe_device",
     "enable_safe_output",

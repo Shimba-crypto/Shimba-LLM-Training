@@ -136,6 +136,8 @@ Useful flags:
 
 | Flag | Meaning |
 |---|---|
+| `--sft` | supervised fine-tuning: loss on response tokens only (prompts masked with -1), validation split by document |
+| `--sft_template` | `instruction` (default, `Instruction:/Response:`) or `chat` (`User:/Assistant:`) |
 | `--device` | `auto` (default), `cpu`, `cuda`, `cuda:1`, `mps` |
 | `--amp` | mixed precision on CUDA — near-free speedup on a T4 |
 | `--compile` | `torch.compile`; slower first run, off by default |
@@ -344,6 +346,24 @@ python quantize.py --model model.pth --out model_fp16.pth --dtype float16
 An int8 checkpoint only loads back into an int8-quantized model — you cannot
 `GPT.load()` it directly. float16 loads normally but only really helps on GPU.
 
+### Flash SLMs
+
+`flash_slms.py` packs small models into fast `*_flash.pth` files (KV-cache
+metadata, fp16/int8 optional) and probes them with exact-match eval:
+
+```bash
+python flash_slms.py specs                                  # 10M / 50M / 100M configs
+python flash_slms.py pack --model m.pth --out m_flash.pth
+python flash_slms.py verify --model m_flash.pth --probes 60
+```
+
+`verify` scores answers through the KV-cache path and re-derives every
+expected value in vida (`vendor/vida`, built with `make -C vendor/vida`)
+as an independent second opinion — a mismatch there is a probe bug, never
+a model miss. Without a built `vda` binary it falls back to Python
+(`VDA_BIN` overrides the lookup). Set `VDA_BIN` to point at any vida
+binary explicitly.
+
 ## Project structure
 
 ```
@@ -353,6 +373,7 @@ An int8 checkpoint only loads back into an int8-quantized model — you cannot
 ├── quick_test.py         # smoke test, no corpus required
 ├── chat.py               # interactive chat
 ├── flash.py              # pack / info / generate for *_flash.pth fast models
+├── flash_slms.py         # flash-10M/50M/100M specs, pack, vida-verified eval
 ├── quantize.py           # int8 / fp16 export
 ├── merge.py              # average / slerp checkpoint merge
 ├── scw.py                # .scw pack / info / unpack
@@ -373,7 +394,9 @@ An int8 checkpoint only loads back into an int8-quantized model — you cannot
     ├── train.py          # Trainer, TrainConfig, resume_from
     ├── generate.py       # generate(), iter_generate(), stream_generate()
     ├── flash.py          # flash arch helpers, KVCache, fast_generate(), pack/load
-    ├── checkpoint.py     # canonical save/load, legacy-format tolerance  
+    ├── sft.py            # SFTTrainer, masked pair datasets, pair loaders
+    ├── vida_compute.py   # vda bridge: 2nd-opinion arithmetic, eval scoring
+    ├── checkpoint.py     # canonical save/load, legacy-format tolerance    
     ├── scw.py            # .scw single-file format (mmap, q8_0)
     ├── device.py         # CUDA / MPS / CPU resolution
     └── compat.py         # Windows console encoding shim

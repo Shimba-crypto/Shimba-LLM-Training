@@ -1,0 +1,3 @@
+[submodule "vendor/vida"]
+	path = vendor/vida
+	url = https://github.com/Shimba-crypto/vida.git
