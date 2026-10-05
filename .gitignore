@@ -66,6 +66,4 @@ fetch_point_data.py
 build_suprathinker_notebook.py
 build_math_50M_notebook.py
 build_math_dataset.py
-flash.py
-llm/flash.py
 *.ipynb
