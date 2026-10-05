@@ -248,9 +248,10 @@ def map_names(state_dict: dict, cfg, compat: str = "none"):
         # against its shape checks for gpt2; llama matches HF Linear layout).
         mapped.append((name, v))
     if compat == "gpt2":
-        # GPT-2 LayerNorms and dense layers carry biases; ours are
-        # bias-free, so emit matching zero biases (mathematically identical,
-        # keeps the file loadable).
+        # GPT-2 LayerNorms and dense layers carry biases. Checkpoints from
+        # the shimba arch are bias-free, so emit matching zero biases
+        # (mathematically identical, keeps the file loadable). Checkpoints
+        # already carrying real biases (gpt2 arch, HF imports) keep theirs.
         by_name = dict(mapped)
         extra = []
         for name, w in mapped:
@@ -261,6 +262,8 @@ def map_names(state_dict: dict, cfg, compat: str = "none"):
             if not (leaf in ("attn_qkv", "attn_output", "attn_norm",
                              "ffn_norm", "ffn_up", "ffn_down")
                     or base == "output_norm"):
+                continue
+            if base + ".bias" in by_name:
                 continue
             dim = w.shape[0]
             extra.append((base + ".bias", torch.zeros(dim)))
@@ -341,11 +344,19 @@ def build_metadata(cfg, tokenizer: CharTokenizer, model_name: str,
     if bpe_chars and not real_merges:
         tokens = [_gpt2_byte_encode(t) for t in tokens]
     types = []
+    # Our own tokenizers put PAD at 0 and UNK at 1; an HF import (GPT-2
+    # layout) carries neither and marks its EOS as control instead. Absent
+    # attributes fall back to the historical behaviour, so existing models
+    # export byte-identically to before.
+    pad_id = getattr(tokenizer, "pad_id", 0)
+    unk_id = getattr(tokenizer, "unk_id", 1)
+    eos_id = getattr(tokenizer, "eos_id", None)
+    bos_id = getattr(tokenizer, "bos_id", None)
     for i in range(tokenizer.vocab_size):
-        if i == 0:
-            types.append(3)  # control (PAD)
-        elif i == 1:
-            types.append(2)  # unknown (UNK)
+        if i == eos_id or (pad_id is not None and i == pad_id):
+            types.append(3)  # control
+        elif unk_id is not None and i == unk_id:
+            types.append(2)  # unknown
         else:
             types.append(1)  # normal
     if compat == "llama":
@@ -369,10 +380,16 @@ def build_metadata(cfg, tokenizer: CharTokenizer, model_name: str,
             # No BPE merges: with an empty list every word stays split into
             # single characters, which then match the char-level vocab below.
             kvs.append(("tokenizer.ggml.merges", VT_ARRAY, (VT_STRING, [])))
-    kvs.append(("tokenizer.ggml.unknown_token_id", VT_UINT32, 1))
-    kvs.append(("tokenizer.ggml.padding_token_id", VT_UINT32, 0))
-    kvs.append(("tokenizer.ggml.add_bos_token", VT_BOOL, False))
-    kvs.append(("tokenizer.ggml.add_eos_token", VT_BOOL, False))
+    kvs.append(("tokenizer.ggml.unknown_token_id", VT_UINT32,
+                unk_id if unk_id is not None else 1))
+    kvs.append(("tokenizer.ggml.padding_token_id", VT_UINT32,
+                pad_id if pad_id is not None else 0))
+    kvs.append(("tokenizer.ggml.add_bos_token", VT_BOOL, bos_id is not None))
+    kvs.append(("tokenizer.ggml.add_eos_token", VT_BOOL, eos_id is not None))
+    if bos_id is not None:
+        kvs.append(("tokenizer.ggml.bos_token_id", VT_UINT32, bos_id))
+    if eos_id is not None:
+        kvs.append(("tokenizer.ggml.eos_token_id", VT_UINT32, eos_id))
     return kvs
 
 

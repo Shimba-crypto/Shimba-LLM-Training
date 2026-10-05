@@ -91,14 +91,21 @@ def split_thinking(text: str, think_start: Optional[str] = None,
 # ---------------------------------------------------------------------------
 
 def _apply_repetition_penalty(logits: torch.Tensor, seen_ids, penalty: float) -> None:
-    """Divide logits of seen tokens by penalty, in one indexed op."""
+    """Penalise already-seen tokens, matching HF semantics.
+
+    Positive logits are divided (shrunk toward zero) and negative logits
+    are multiplied (pushed further down). A blind division would do the
+    opposite for negative logits — boosting repeats instead of curbing
+    them, which is exactly the instant-echo failure mode.
+    """
     if penalty == 1.0 or not seen_ids:
         return
-    # seen_ids is a set/list of ints; single indexed division.
+    # seen_ids is a set/list of ints; single indexed op.
     idx = torch.as_tensor(list(seen_ids), dtype=torch.long, device=logits.device)
     idx = idx[idx < logits.size(-1)]
     if idx.numel():
-        logits[0, idx] /= penalty
+        vals = logits[0, idx]
+        logits[0, idx] = torch.where(vals < 0, vals * penalty, vals / penalty)
 
 
 def _sample_next(logits: torch.Tensor, temperature: float,

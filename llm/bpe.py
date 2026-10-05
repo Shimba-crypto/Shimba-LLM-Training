@@ -183,6 +183,12 @@ class BPETokenizer:
         self.vocab_size: int = 0
         self._ranks: dict = {}
         self._cache: dict = {}
+        # Special-token ids. Ours default to PAD=0/UNK=1; an HF import
+        # (GPT-2 layout) carries none of those and sets eos_id instead.
+        self.pad_id: int | None = 0
+        self.unk_id: int | None = 1
+        self.eos_id: int | None = None
+        self.bos_id: int | None = None
 
     # ------------------------------------------------------------------
     # Construction
@@ -245,7 +251,7 @@ class BPETokenizer:
 
     def encode(self, text: str) -> list:
         """Convert string to list of integer token ids."""
-        unk = self.vocab.get(UNK_TOKEN, 1)
+        unk = self.unk_id if self.unk_id is not None else 1
         ids = []
         for word in pre_tokenize(text):
             for tok in self._bpe_word(word):
@@ -255,7 +261,14 @@ class BPETokenizer:
     def decode(self, ids: list) -> str:
         """Convert list of integer token ids to string."""
         parts = []
+        skip = set()
+        if self.pad_id is not None:
+            skip.add(self.pad_id)
+        if self.unk_id is not None:
+            skip.add(self.unk_id)
         for i in ids:
+            if i in skip:
+                continue
             tok = self.idx2char.get(i, UNK_TOKEN)
             if tok not in (PAD_TOKEN, UNK_TOKEN):
                 parts.append(tok)
@@ -272,6 +285,10 @@ class BPETokenizer:
             "vocab": self.vocab,
             "merges": self.merges,
             "vocab_size": self.vocab_size,
+            "pad_id": self.pad_id,
+            "unk_id": self.unk_id,
+            "eos_id": self.eos_id,
+            "bos_id": self.bos_id,
         }
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False)
@@ -290,6 +307,10 @@ class BPETokenizer:
         tok = cls()
         tok.merges = [list(m) for m in data["merges"]]
         tok.vocab = {k: int(v) for k, v in data["vocab"].items()}
+        tok.pad_id = data.get("pad_id", 0)
+        tok.unk_id = data.get("unk_id", 1)
+        tok.eos_id = data.get("eos_id")
+        tok.bos_id = data.get("bos_id")
         tok._finalize()
         print(f"[tokenizer] loaded ← {path}  (BPE vocab_size={tok.vocab_size})")
         return tok
