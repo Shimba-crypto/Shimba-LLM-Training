@@ -108,7 +108,7 @@ def best_combo(budget, items):
     return [name for name, _ in combo], total
 
 
-def build_afford(rng, count=420):
+def build_afford(rng, count=300):
     for _ in range(count):
         k = rng.randint(3, 5)
         items = rng.sample(ITEMS, k)
@@ -130,9 +130,32 @@ def build_afford(rng, count=420):
                 f"Buy the {pick}",
                 f"it costs {fmt_money(price)}, the highest price at or "
                 f"under {fmt_money(budget)}")
-    # optimal-combo rows: fewer, harder, each repeated so the method sticks
-    for _ in range(90):
-        items = rng.sample(ITEMS, 3)
+    # Drill the other trap: a tempting item sits just ABOVE the budget and
+    # the right answer is the dearest item at or under it (the model tends
+    # to grab the over-budget item).
+    for _ in range(120):
+        items = rng.sample(ITEMS, rng.randint(3, 5))
+        top = max(p for _, p in items)
+        budget = top - rng.choice([1, 2, 3, 5])
+        if budget < 1:
+            continue
+        menu = ", ".join(f"{name} {fmt_money(p)}" for name, p in items)
+        pick = best_single(budget, items)
+        if pick is None:
+            continue
+        price = next(p for name, p in items if name == pick)
+        add("afford",
+            f"You have {fmt_money(budget)}. The shop sells: {menu}. "
+            f"Which single item is the most expensive one you can afford?",
+            f"Buy the {pick}",
+            f"it costs {fmt_money(price)}, the highest price at or "
+            f"under {fmt_money(budget)}",
+            rep=2)
+    # optimal-combo rows: this is the model's weakest group — draw a wider
+    # menu (4 items), generate many more, and drill them harder so it picks
+    # the right subset instead of inventing off-menu items.
+    for _ in range(170):
+        items = rng.sample(ITEMS, 4)
         budget = rng.randint(20, 100)
         menu = ", ".join(f"{name} {fmt_money(p)}" for name, p in items)
         combo = best_combo(budget, items)
@@ -141,7 +164,7 @@ def build_afford(rng, count=420):
                 f"You have {fmt_money(budget)}. The shop sells: {menu}. "
                 f"Is there any pair you can afford together?",
                 "No affordable pair",
-                f"every pair costs more than {fmt_money(budget)}", rep=2)
+                f"every pair costs more than {fmt_money(budget)}", rep=3)
         else:
             names, total = combo
             add("afford",
@@ -149,7 +172,7 @@ def build_afford(rng, count=420):
                 f"Which items together give the highest total without going over?",
                 f"Buy {' and '.join(names)}",
                 f"they total {fmt_money(total)}, the highest affordable "
-                f"total under {fmt_money(budget)}", rep=2)
+                f"total under {fmt_money(budget)}", rep=3)
 
 
 # ===========================================================================
@@ -302,6 +325,28 @@ def build_ev(rng, count=220):
                 f"Which has the higher expected value?",
                 "They are equal",
                 f"both are worth {fmt_money(sure)} on average")
+
+    # Drill the case the model gets wrong: the gamble actually wins. The
+    # first pass leaves the sure amount uniform, which under-represents
+    # "Take option A" once the margin is thin, so add explicit A-wins rows
+    # across small margins and repeat them.
+    for _ in range(count):
+        pct = rng.choice([10, 20, 25, 30, 40, 50, 60, 75, 80])
+        prize = rng.choice([20, 40, 50, 80, 100, 120, 200])
+        ev = pct * prize / 100
+        ev_s = int(ev) if ev == int(ev) else round(ev, 2)
+        margin = rng.choice([1, 2, 3, 5, 10, 15, 25])
+        beat = int(ev) - margin
+        if ev <= beat or beat < 1:
+            continue
+        add("ev",
+            f"Option A is a {pct}% chance of {fmt_money(prize)}. "
+            f"Option B is {fmt_money(beat)} for sure. "
+            f"Which has the higher expected value?",
+            "Take option A",
+            f"its expected value is {pct}% of {prize}, which is "
+            f"{fmt_money(ev_s)}, above {fmt_money(beat)}",
+            rep=2)
 
 
 # ===========================================================================
